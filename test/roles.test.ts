@@ -120,4 +120,19 @@ describe("prompts and commands", () => {
     expect(lastAssistantText(msgs)).toBe("final")
     expect(lastAssistantText([])).toBe("")
   })
+  test("prompts and contract have no literal {repo} and name the worktree parent", () => {
+    const c = cfg()
+    expect(contract(c, layout)).not.toContain("{repo}")
+    expect(contract(c, layout)).toContain(layout.worktreeParent)
+    for (const role of ROLES) {
+      const p = rolePrompt(c, role, layout)
+      expect(p).not.toContain("{repo}")
+      expect(p).toContain(layout.worktreeParent)
+    }
+  })
+  test("/tf-ship names the base branch, not <base>", () => {
+    const ship = commandSpecs(cfg(), { ...layout, base: "develop" }).find((s) => s.name === "tf-ship")!.render("")
+    expect(ship).toContain("develop")
+    expect(ship).not.toContain("<base>")
+  })
 })
