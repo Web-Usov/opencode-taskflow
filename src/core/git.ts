@@ -70,9 +70,14 @@ export function run(cmd: string, args: string[], cwd: string, opts: RunOptions =
     child.stderr.on("data", (d: string) => (stderr += d))
     child.on("error", (e) => finish({ ok: false, code: null, stdout, stderr: `${stderr}${e.message}` }))
     child.on("close", (code) => finish({ ok: code === 0 && !killed, code, stdout, stderr }))
-    // a killed command may leave grandchildren holding the pipes: resolve on exit after a short grace period
+    // a command may exit while a background grandchild still holds the pipes (or was killed): resolve on exit after a
+    // short grace period for the remaining output, then stop reading
     child.on("exit", (code) => {
-      if (killed) setTimeout(() => finish({ ok: false, code, stdout, stderr }), 200).unref()
+      setTimeout(() => {
+        finish({ ok: code === 0 && !killed, code, stdout, stderr })
+        child.stdout.destroy()
+        child.stderr.destroy()
+      }, killed ? 200 : 500).unref()
     })
   })
 }
@@ -162,14 +167,34 @@ const fetches = new Map<string, { at: number; done: boolean; pending: Promise<{ 
 export function fetchShared(mainDir: string, remote: string, opts: { maxAgeMs?: number; signal?: AbortSignal } = {}): Promise<{ ok: boolean; error?: string }> {
   const key = `${mainDir}\u0000${remote}`
   const prev = fetches.get(key)
-  if (prev && (!prev.done || Date.now() - prev.at < (opts.maxAgeMs ?? 0))) return prev.pending
+  const withSignal = (p: Promise<{ ok: boolean; error?: string }>) => {
+    // the shared fetch is not tied to one caller's signal; each caller only stops waiting
+    const signal = opts.signal
+    if (!signal) return p
+    if (signal.aborted) return Promise.resolve({ ok: false, error: "aborted" })
+    return Promise.race([p, new Promise<{ ok: boolean; error?: string }>((resolve) => signal.addEventListener("abort", () => resolve({ ok: false, error: "aborted" }), { once: true }))])
+  }
+  if (prev && (!prev.done || Date.now() - prev.at < (opts.maxAgeMs ?? 0))) return withSignal(prev.pending)
   const entry = { at: Date.now(), done: false, pending: Promise.resolve({ ok: true }) as Promise<{ ok: boolean; error?: string }> }
-  entry.pending = run("git", ["fetch", remote], mainDir, { timeout: NET_TIMEOUT, signal: opts.signal }).then((r) => {
+  entry.pending = run("git", ["fetch", remote], mainDir, { timeout: NET_TIMEOUT }).then((r) => {
     entry.done = true
     entry.at = Date.now()
     if (!r.ok) fetches.delete(key)
     return r.ok ? { ok: true } : { ok: false, error: r.stderr.trim().split("\n").pop() || "error" }
   })
   fetches.set(key, entry)
-  return entry.pending
+  return withSignal(entry.pending)
+}
+
+/** Runs `fn` exclusively per key (e.g. one claim per repository at a time). */
+const locks = new Map<string, Promise<unknown>>()
+export function exclusive<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prev = locks.get(key) ?? Promise.resolve()
+  const next = prev.then(fn, fn)
+  const tail = next.catch(() => undefined)
+  locks.set(key, tail)
+  void tail.then(() => {
+    if (locks.get(key) === tail) locks.delete(key)
+  })
+  return next
 }

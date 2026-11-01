@@ -85,7 +85,12 @@ export function roleRules(cfg: TaskflowConfig, role: Role, layout: RepoLayout): 
     ...FORCE_PUSH.map((r) => deny("shell", r)),
     ...[`git push * ${base}`, `git push * ${base} *`, `git push *:${base}`, `git push *:${base} *`, `git push *:refs/heads/${base}`, `git push *:refs/heads/${base} *`].map((r) => deny("shell", r)),
   ]
-  const noMerge = [deny("shell", "gh pr merge*"), deny("shell", "gh api*/merge*"), deny("shell", "gh api graphql*")]
+  const noMerge = [
+    deny("shell", "gh pr merge*"),
+    deny("shell", "gh api*/pulls/*/merge*"),
+    deny("shell", "gh api graphql*mergePullRequest*"),
+    deny("shell", "gh api graphql*enablePullRequestAutoMerge*"),
+  ]
   const tools = (write: boolean, dispatch: boolean): Rule[] => [
     ...(write ? [] : [deny(TOOL_PERMISSION.write, "*")]),
     ...(dispatch ? [] : [deny(TOOL_PERMISSION.dispatch, "*")]),
@@ -170,46 +175,99 @@ export function shellWords(cmd: string): string[] {
   return words
 }
 
-/** Splits a script into simple commands at `;`, `&&`, `||`, `|`, `&` and newlines outside quotes (quotes are kept). */
+/**
+ * Splits a script into simple commands at `;`, `&&`, `||`, `|`, `&` and newlines outside quotes (quotes are kept).
+ * Heredoc bodies (`<<EOF ... EOF`, `<<-EOF`, quoted delimiters) are data, not commands, and are dropped.
+ */
 export function splitCommands(script: string): string[] {
   const out: string[] = []
   let cur = ""
   let q: '"' | "'" | null = null
+  const pendingHeredocs: Array<{ delim: string; strip: boolean }> = []
+  const push = () => {
+    if (cur.trim()) out.push(cur.trim())
+    cur = ""
+  }
   for (let i = 0; i < script.length; i++) {
     const c = script[i]!
     if (q) {
       cur += c
       if (c === "\\" && q === '"' && i + 1 < script.length) cur += script[++i]
       else if (c === q) q = null
-    } else if (c === "'" || c === '"') {
+      continue
+    }
+    if (c === "<" && script[i + 1] === "<" && script[i + 2] !== "<") {
+      const m = /^<<(-?)\s*(['"]?)([A-Za-z_][\w-]*)\2/.exec(script.slice(i))
+      if (m) {
+        pendingHeredocs.push({ delim: m[3]!, strip: m[1] === "-" })
+        i += m[0].length - 1
+        continue
+      }
+    }
+    if (c === "'" || c === '"') {
       q = c
       cur += c
     } else if (c === "\\" && i + 1 < script.length) {
       cur += c + script[++i]
-    } else if (c === ";" || c === "\n" || c === "|" || c === "&") {
-      if (cur.trim()) out.push(cur.trim())
-      cur = ""
+    } else if (c === "\n") {
+      push()
+      // skip heredoc bodies that start after this newline
+      while (pendingHeredocs.length) {
+        const h = pendingHeredocs.shift()!
+        let j = i + 1
+        for (;;) {
+          const end = script.indexOf("\n", j)
+          const line = script.slice(j, end === -1 ? script.length : end)
+          if ((h.strip ? line.replace(/^\t+/, "") : line) === h.delim || end === -1) {
+            i = end === -1 ? script.length : end
+            break
+          }
+          j = end + 1
+        }
+      }
+    } else if (c === ";" || c === "|" || c === "&") {
+      push()
+    } else if ((c === ">" || c === "<") && !cur.endsWith(" ")) {
+      cur += " " + c // a redirect ends the previous word: `HEAD:main>/dev/null`
     } else cur += c
   }
-  if (cur.trim()) out.push(cur.trim())
+  push()
   return out
 }
 
-const WRAPPERS = new Set(["env", "command", "exec", "sudo", "nohup", "time", "nice", "xargs"])
+const WRAPPERS = new Set(["env", "command", "exec", "sudo", "doas", "nohup", "time", "nice", "xargs", "timeout", "stdbuf", "ionice", "setsid"])
+/** Wrapper options that take a separate value (`nice -n 10`, `sudo -u bob`, `env -u X`, `xargs -n 1`). */
+const WRAPPER_VALUE_OPTS = new Set(["-n", "-u", "-g", "-C", "-E", "-I", "-L", "-P", "-s", "-k", "--signal", "--kill-after"])
 const SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh"])
 
 /** argv of every simple command in a command line, unwrapping `env`, `sudo`, `bash -c '...'` and similar. */
 export function simpleCommands(cmd: string, depth = 0): string[][] {
   const result: string[][] = []
   for (const part of splitCommands(cmd)) {
-    let w = shellWords(part)
-    while (w.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w[0]!) || WRAPPERS.has(w[0]!) || (w[0] === "env" && w[1]?.startsWith("-")))) {
-      w = w.slice(1)
-      while (w.length && w[0]!.startsWith("-") && !SHELLS.has(w[0]!)) w = w.slice(1)
+    let w = shellWords(part).filter((x, i, all) => !/^\d*[<>]/.test(x) && !/^\d*[<>]/.test(all[i - 1] ?? "")) // drop redirects
+    for (;;) {
+      if (w.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(w[0]!)) {
+        w = w.slice(1)
+        continue
+      }
+      const head = w[0]?.split("/").pop()
+      if (head && WRAPPERS.has(head)) {
+        w = w.slice(1)
+        while (w.length && w[0]!.startsWith("-")) w = WRAPPER_VALUE_OPTS.has(w[0]!) ? w.slice(2) : w.slice(1)
+        if (head === "timeout" && w.length && /^\d/.test(w[0]!)) w = w.slice(1) // timeout DURATION cmd
+        while (w.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(w[0]!)) w = w.slice(1) // env K=V cmd
+        continue
+      }
+      break
     }
     if (!w.length) continue
     const name = w[0]!.split("/").pop()!
-    const ci = w.indexOf("-c")
+    if (name === "eval" && depth < 3) {
+      result.push(...simpleCommands(w.slice(1).join(" "), depth + 1))
+      continue
+    }
+    // bash -c, bash -lc, sh -ec ...: the first argument after a short-option cluster containing "c" is the script
+    const ci = w.findIndex((x, i) => i > 0 && /^-[a-zA-Z]*c[a-zA-Z]*$/.test(x))
     if (SHELLS.has(name) && ci > 0 && w[ci + 1] !== undefined && depth < 3) {
       result.push(...simpleCommands(w[ci + 1]!, depth + 1))
       continue
@@ -251,7 +309,7 @@ export function badPush(cmd: string, base: string): string | null {
     if (sub[0] !== "push") continue
     const shown = argv.join(" ")
     for (const a of sub.slice(1)) {
-      if (/^(--force|--force-with-lease|--force-if-includes|-f|--mirror|--delete|-d|--all|--prune)(=|$)/.test(a) || /^-[a-zA-Z]*f/.test(a)) return `"${shown}" uses ${a}`
+      if (/^(--force|--force-with-lease|--force-if-includes|-f|--mirror|--delete|-d|--all|--prune)(=|$)/.test(a) || /^-[a-zA-Z]*f[a-zA-Z]*$/.test(a)) return `"${shown}" uses ${a}`
       if (a.startsWith("+")) return `"${shown}" force-pushes through the refspec ${a}`
       if (a.startsWith("-")) continue
       const dst = a.includes(":") ? a.slice(a.lastIndexOf(":") + 1) : a
@@ -288,9 +346,13 @@ function reviewerShellProblem(argv: string[], cfg: TaskflowConfig): string | nul
     const sub = gitSubcommand(argv)
     if (sub[0] === "worktree" && (sub[1] === "add" || sub[1] === "remove")) {
       const target = sub.slice(2).find((a) => !a.startsWith("-"))
-      if (!target || !REVIEW_TMP.test(target) || sub.includes("--force") || sub.includes("-f")) {
-        return `the reviewer may only add/remove its own throwaway worktrees /tmp/review-<n> (no --force); got "${shown}"`
+      const branchy = sub.some((a) => ["-b", "-B", "--force", "-f", "--track"].includes(a))
+      if (!target || !REVIEW_TMP.test(target) || branchy) {
+        return `the reviewer may only add/remove its own throwaway worktrees /tmp/review-<n> (detached, no -b/-B/--force); got "${shown}"`
       }
+    }
+    if (sub[0] === "fetch" && sub.slice(1).some((a) => a.includes(":") || a.startsWith("+"))) {
+      return `the reviewer fetches without refspecs that write local branches; got "${shown}"`
     }
   }
   return null

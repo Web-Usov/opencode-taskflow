@@ -169,7 +169,9 @@ export default define({
                   () => null,
                   (e: unknown) => String((e as Error)?.message ?? e),
                 )
-                if (moved) report += `\nNOTE: this session could not be moved into ${r.worktree} (${moved}); pass that directory to every tool and shell command.`
+                if (moved) {
+                  report += `\nMOVE FAILED: this session is still in the main checkout (${moved}). Do NOT edit files from here: tell the human to open a new session in ${r.worktree} and stop.`
+                }
               }
             }
             if (switchTo) {

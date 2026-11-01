@@ -31,7 +31,7 @@ export function commandSpecs(cfg: TaskflowConfig, layout: RepoLayout): CommandSp
       claimArg: true,
       render: (a, report) =>
         a.trim()
-          ? `${report ?? ""}\n\nIf the claim above FAILED, explain the reason to the human (blocked, unfinished depends, not todo, fetch error) and stop. Otherwise this session now runs in the task's worktree as the implementer: call \`tf_task\` with id "${a.trim()}", print the spec rule IDs it cites and a short plan, then implement the task following your procedure (tests first, verify, then /${p}ship).`
+          ? `${report ?? ""}\n\nIf the claim above FAILED or says MOVE FAILED, explain the reason to the human (blocked, unfinished depends, not todo, fetch error, session not moved) and stop. Otherwise this session now runs in the task's worktree as the implementer: call \`tf_task\` with id "${a.trim()}", print the spec rule IDs it cites and a short plan, then implement the task following your procedure (tests first, verify, then /${p}ship).`
           : `Call \`tf_next\`. List the ready tasks one line each (id, title, area, size, spec rules). Check work already in flight (\`gh pr list\`, \`tf_status\`) and recommend ONE task that does not touch the same module as an in-flight task, with a one-line reason. Do not start it.`,
     },
     {

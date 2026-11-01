@@ -2,7 +2,7 @@ import fs from "node:fs"
 import path from "node:path"
 import { taskIdRe, type CopySpec, type TaskflowConfig } from "../config.ts"
 import { asList, asString, parseFrontmatter } from "./frontmatter.ts"
-import { baseRefOf, detectBaseBranch, fetchShared, git, hasRemote, mainCheckout, NET_TIMEOUT, run, runShell, tryGit } from "./git.ts"
+import { baseRefOf, detectBaseBranch, exclusive, fetchShared, git, hasRemote, mainCheckout, NET_TIMEOUT, run, runShell, tryGit } from "./git.ts"
 import { setStatus, writeBoard } from "./tasks.ts"
 
 // ---------- ids ----------
@@ -137,6 +137,17 @@ export interface ClaimResult {
  * On failure after the worktree exists, it is removed again unless `keep`.
  */
 export async function claim(input: ClaimInput): Promise<ClaimResult> {
+  // one claim per repository at a time: two claims of the same id must not both pass the existence checks
+  let key = input.cwd
+  try {
+    key = mainCheckout(input.cwd)
+  } catch {
+    /* reported by claimUnlocked */
+  }
+  return exclusive(`claim:${key}`, () => claimUnlocked(input))
+}
+
+async function claimUnlocked(input: ClaimInput): Promise<ClaimResult> {
   const { cfg } = input
   const log: string[] = []
   const fail = (error: string): ClaimResult => ({ ok: false, log, error })
