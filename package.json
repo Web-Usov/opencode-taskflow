@@ -1,0 +1,25 @@
+{
+  "name": "opencode-taskflow",
+  "version": "0.1.0",
+  "description": "OpenCode V2 plugin: epic -> task -> worktree -> PR -> review -> merge workflow with role agents, model chains and guard rails",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "files": ["index.ts", "src", "templates", "README.md", "LICENSE"],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "check": "bun run typecheck && bun test",
+    "e2e": "bash scripts/e2e.sh"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.0.22",
+    "@types/bun": "latest",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "opencode": ">=2.0.22"
+  }
+}
