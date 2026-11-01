@@ -3,7 +3,7 @@ import type { Role, TaskflowConfig } from "./config.ts"
 import { agentChain, agentName, ROLES } from "./config.ts"
 import { claim, clean, planWorktree } from "./core/claim.ts"
 import { asString } from "./core/frontmatter.ts"
-import { baseRefOf, detectBaseBranch, hasRemote, NET_TIMEOUT, run, tryGit } from "./core/git.ts"
+import { baseRefOf, detectBaseBranch, fetchShared, hasRemote, NET_TIMEOUT, run, tryGit } from "./core/git.ts"
 import { TOOL_PERMISSION, type RepoLayout } from "./core/guard.ts"
 import { init } from "./core/init.ts"
 import { formatModelRef, resolveChain, routeCategory, type AvailableModel, type ModelRef } from "./core/models.ts"
@@ -126,13 +126,17 @@ export function buildTools(host: ToolHost): ToolDef[] {
       return null
     }
   }
-  /** Task docs as merged on the base (after a fetch), falling back to the working tree. */
+  /** Task docs as merged on the base (after a throttled fetch), falling back to the working tree. */
   const mergedDocs = async (root: string, signal: AbortSignal): Promise<{ docs: Doc[]; source: string }> => {
     const cfg = cfgNow()
-    if (hasRemote(root, cfg.git.remote)) await run("git", ["fetch", cfg.git.remote], root, { timeout: NET_TIMEOUT, signal })
+    let note = ""
+    if (hasRemote(root, cfg.git.remote)) {
+      const f = await fetchShared(host.layout().mainDir, cfg.git.remote, { signal, maxAgeMs: 45_000 })
+      if (!f.ok) note = ` (fetch failed: ${f.error}; data may be stale)`
+    }
     const ref = baseRef(root)
     const docs = ref ? loadTasksFromRef(root, cfg, ref) : null
-    return docs ? { docs, source: ref! } : { docs: loadTasks(root, cfg), source: "working tree" }
+    return docs ? { docs, source: ref! + note } : { docs: loadTasks(root, cfg), source: "working tree" + note }
   }
 
   return [
@@ -159,8 +163,13 @@ export function buildTools(host: ToolHost): ToolDef[] {
         out.push(c.ok ? "tf_check: OK" : `tf_check: ${c.errors.length} error(s):\n  - ${c.errors.join("\n  - ")}`)
         if (input?.gh) {
           const prs = await run("gh", ["pr", "list", "--json", "number,title,headRefName,isDraft,statusCheckRollup,mergeStateStatus,autoMergeRequest"], root, { timeout: NET_TIMEOUT, signal: ctx.signal })
-          if (prs.ok) {
-            const list = JSON.parse(prs.stdout) as Array<any>
+          let list: Array<any> | null = null
+          try {
+            list = prs.ok ? (JSON.parse(prs.stdout) as Array<any>) : null
+          } catch {
+            list = null
+          }
+          if (list) {
             out.push("", `Open PRs (${list.length}):`)
             for (const p of list) {
               const checks = (p.statusCheckRollup ?? []) as Array<any>

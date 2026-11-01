@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test"
+import fs from "node:fs"
+import path from "node:path"
 import { agentChain, loadConfig, parseJsonc } from "../src/config.ts"
 import { check } from "../src/core/tasks.ts"
 import { cfg, epicFile, taskFile, tmpdir, write } from "./helpers.ts"
@@ -43,5 +45,23 @@ describe("task.idPadding", () => {
     expect(check(root, c).errors).toEqual([])
     write(root, "tasks/T-1-x.md", taskFile({ id: "T-1" }))
     expect(check(root, c).errors.some((e) => e.includes("T-1-x.md"))).toBe(true)
+  })
+})
+
+describe("round-2 config fixes", () => {
+  test("a project `models` overrides a global `model`", () => {
+    const root = tmpdir()
+    const globalFile = path.join(root, "g.jsonc")
+    fs.writeFileSync(globalFile, `{ "agents": { "implementer": { "model": "a/global" } } }`)
+    write(root, ".opencode/taskflow.jsonc", `{ "agents": { "implementer": { "models": ["b/project", "c/next"] } } }`)
+    expect(agentChain(loadConfig(root, undefined, globalFile).config, "implementer")).toEqual(["b/project", "c/next"])
+  })
+  test("timeout is capped and empty paths are rejected", () => {
+    const root = tmpdir()
+    write(root, ".opencode/taskflow.jsonc", `{ "dispatch": { "timeoutMinutes": 999999 }, "paths": { "tasks": "" } }`)
+    const { config, sources } = loadConfig(root, undefined, "/nonexistent")
+    expect(config.dispatch.timeoutMinutes).toBe(180)
+    expect(config.paths.tasks).toBe("tasks")
+    expect(sources.find((s) => s.path === "(validation)")!.error).toContain("dispatch.timeoutMinutes")
   })
 })

@@ -71,20 +71,21 @@ const FORCE_PUSH = ["git push --force*", "git push -f*", "git push * --force*", 
 export function roleRules(cfg: TaskflowConfig, role: Role, layout: RepoLayout): Rule[] {
   const deny = (action: string, resource: string): Rule => ({ action, resource, effect: "deny" })
   const allow = (action: string, resource: string): Rule => ({ action, resource, effect: "allow" })
-  const { base, mainDir, worktreeParent } = layout
-  /** A repo-relative glob as resources: relative, inside the main checkout, inside any worktree. */
+  const { base, mainDir } = layout
+  /**
+   * Static rules see edit resources relative to the session directory, or absolute outside it. Absolute variants are
+   * emitted only for the main checkout (an exact prefix); worktree paths at unknown depth would over-match because `*`
+   * also matches `/`, so absolute paths in worktrees are left to the guard hook, which resolves them precisely.
+   */
   const everywhere = (glob: string) => {
     const w = toWildcard(glob)
-    return [w, `${mainDir}/${w}`, `${worktreeParent}/*/${w}`]
+    return [w, `${mainDir}/${w}`]
   }
   const common: Rule[] = [
     ...FORCE_PUSH.map((r) => deny("shell", r)),
-    deny("shell", `git push * ${base}`),
-    deny("shell", `git push * ${base} *`),
-    deny("shell", `git push *:${base}*`),
-    deny("shell", `git push *:refs/heads/${base}*`),
+    ...[`git push * ${base}`, `git push * ${base} *`, `git push *:${base}`, `git push *:${base} *`, `git push *:refs/heads/${base}`, `git push *:refs/heads/${base} *`].map((r) => deny("shell", r)),
   ]
-  const noMerge = [deny("shell", "gh pr merge*"), deny("shell", "*gh pr merge*"), deny("shell", "*gh api*/merge*")]
+  const noMerge = [deny("shell", "gh pr merge*"), deny("shell", "gh api*/merge*"), deny("shell", "gh api graphql*")]
   const tools = (write: boolean, dispatch: boolean): Rule[] => [
     ...(write ? [] : [deny(TOOL_PERMISSION.write, "*")]),
     ...(dispatch ? [] : [deny(TOOL_PERMISSION.dispatch, "*")]),
@@ -94,13 +95,13 @@ export function roleRules(cfg: TaskflowConfig, role: Role, layout: RepoLayout): 
     case "implementer":
       return [...common, ...noMerge, ...protectedEdit, ...tools(true, false)]
     case "qa":
-      return [...common, ...noMerge, deny("edit", "*"), ...cfg.qaPaths.flatMap(everywhere).map((r) => allow("edit", r)), ...tools(false, false)]
+      return [...common, ...noMerge, deny("edit", "*"), ...cfg.qaPaths.map((g) => allow("edit", toWildcard(g))), ...tools(false, false)]
     case "planner":
       return [
         ...common,
         ...noMerge,
         deny("edit", "*"),
-        ...[`${cfg.paths.tasks}/**`, `${cfg.paths.epics}/**`, "docs/**", ...cfg.protected].flatMap(everywhere).map((r) => allow("edit", r)),
+        ...[`${cfg.paths.tasks}/**`, `${cfg.paths.epics}/**`, "docs/**", ...cfg.protected].map((g) => allow("edit", toWildcard(g))),
         ...tools(true, false),
       ]
     case "lead":
@@ -109,7 +110,7 @@ export function roleRules(cfg: TaskflowConfig, role: Role, layout: RepoLayout): 
       const verify = [cfg.verify.full, cfg.verify.quick, cfg.verify.e2e].filter((c): c is string => !!c)
       const readOnly = [
         "git status*", "git diff*", "git log*", "git show*", "git ls-tree*", "git grep*", "git fetch*", "git worktree list*",
-        "git worktree add /tmp/*", "git worktree remove /tmp/*", "git -C /tmp/*",
+        "git worktree add /tmp/review-*", "git worktree remove /tmp/review-*", "cd /tmp/review-*",
         "gh pr view*", "gh pr diff*", "gh pr checks*", "gh pr list*", "gh pr review*", "gh pr comment*",
         "gh run list*", "gh run view*", "gh api -X PUT repos/*/pulls/*/update-branch",
         "gh pr merge * --disable-auto",
@@ -136,24 +137,125 @@ export interface GuardEvent {
   resources: readonly string[]
 }
 
-/** Every `gh pr merge ...` / `gh api ... /merge` occurrence in a command line (also inside `bash -c '...'`). */
+// ---------- shell analysis ----------
+
+/** Splits a command line into shell words (quotes and backslashes honoured; no expansion). */
+export function shellWords(cmd: string): string[] {
+  const words: string[] = []
+  let cur = ""
+  let has = false
+  let q: '"' | "'" | null = null
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i]!
+    if (q) {
+      if (c === q) q = null
+      else if (c === "\\" && q === '"' && i + 1 < cmd.length) cur += cmd[++i]
+      else cur += c
+    } else if (c === "'" || c === '"') {
+      q = c
+      has = true
+    } else if (c === "\\" && i + 1 < cmd.length) {
+      cur += cmd[++i]
+      has = true
+    } else if (/\s/.test(c)) {
+      if (has || cur) words.push(cur)
+      cur = ""
+      has = false
+    } else {
+      cur += c
+      has = true
+    }
+  }
+  if (has || cur) words.push(cur)
+  return words
+}
+
+/** Splits a script into simple commands at `;`, `&&`, `||`, `|`, `&` and newlines outside quotes (quotes are kept). */
+export function splitCommands(script: string): string[] {
+  const out: string[] = []
+  let cur = ""
+  let q: '"' | "'" | null = null
+  for (let i = 0; i < script.length; i++) {
+    const c = script[i]!
+    if (q) {
+      cur += c
+      if (c === "\\" && q === '"' && i + 1 < script.length) cur += script[++i]
+      else if (c === q) q = null
+    } else if (c === "'" || c === '"') {
+      q = c
+      cur += c
+    } else if (c === "\\" && i + 1 < script.length) {
+      cur += c + script[++i]
+    } else if (c === ";" || c === "\n" || c === "|" || c === "&") {
+      if (cur.trim()) out.push(cur.trim())
+      cur = ""
+    } else cur += c
+  }
+  if (cur.trim()) out.push(cur.trim())
+  return out
+}
+
+const WRAPPERS = new Set(["env", "command", "exec", "sudo", "nohup", "time", "nice", "xargs"])
+const SHELLS = new Set(["bash", "sh", "zsh", "dash", "ksh"])
+
+/** argv of every simple command in a command line, unwrapping `env`, `sudo`, `bash -c '...'` and similar. */
+export function simpleCommands(cmd: string, depth = 0): string[][] {
+  const result: string[][] = []
+  for (const part of splitCommands(cmd)) {
+    let w = shellWords(part)
+    while (w.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w[0]!) || WRAPPERS.has(w[0]!) || (w[0] === "env" && w[1]?.startsWith("-")))) {
+      w = w.slice(1)
+      while (w.length && w[0]!.startsWith("-") && !SHELLS.has(w[0]!)) w = w.slice(1)
+    }
+    if (!w.length) continue
+    const name = w[0]!.split("/").pop()!
+    const ci = w.indexOf("-c")
+    if (SHELLS.has(name) && ci > 0 && w[ci + 1] !== undefined && depth < 3) {
+      result.push(...simpleCommands(w[ci + 1]!, depth + 1))
+      continue
+    }
+    result.push([name, ...w.slice(1)])
+  }
+  return result
+}
+
+/** git argv without global options: ["push", ...args] for `git -C x -c k=v --no-pager push ...`. */
+function gitSubcommand(argv: string[]): string[] {
+  let i = 1
+  while (i < argv.length && argv[i]!.startsWith("-")) {
+    const opt = argv[i]!
+    i += ["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"].includes(opt) ? 2 : 1
+  }
+  return argv.slice(i)
+}
+
+/** Every merge-capable gh invocation in a command line, normalised to "gh ..." strings. */
 export function mergeCommands(cmd: string): string[] {
   const out: string[] = []
-  for (const m of cmd.matchAll(/\bgh\s+pr\s+merge\b[^;&|\n'"`)]*/g)) out.push(m[0].trim())
-  for (const m of cmd.matchAll(/\bgh\s+api\b[^;&|\n'"`)]*\/merge\b[^;&|\n'"`)]*/g)) out.push(m[0].trim())
+  for (const argv of simpleCommands(cmd)) {
+    if (argv[0] !== "gh") continue
+    if (argv[1] === "pr" && argv[2] === "merge") out.push(argv.join(" "))
+    else if (argv[1] === "api") {
+      const text = argv.slice(2).join(" ")
+      if (/\/pulls\/\d+\/merge\b/.test(text) || /mergePullRequest|enablePullRequestAutoMerge|mergeBranch/.test(text)) out.push(argv.join(" "))
+    }
+  }
   return out
 }
 
 /** Why a `git push` in this command line would write the base branch or rewrite history, or null. */
 export function badPush(cmd: string, base: string): string | null {
-  for (const m of cmd.matchAll(/\bgit\s+(?:-C\s+\S+\s+)?push\b([^;&|\n`)]*)/g)) {
-    const args = m[1]!.trim().split(/\s+/).filter(Boolean).map((a) => a.replace(/^['"]|['"]$/g, ""))
-    for (const a of args) {
-      if (/^(--force|--force-with-lease|--force-if-includes|-f|--mirror|--delete|-d)(=|$)/.test(a)) return `"${m[0].trim()}" uses ${a}`
-      if (a.startsWith("+")) return `"${m[0].trim()}" force-pushes through the refspec ${a}`
+  for (const argv of simpleCommands(cmd)) {
+    if (argv[0] !== "git") continue
+    const sub = gitSubcommand(argv)
+    if (sub[0] !== "push") continue
+    const shown = argv.join(" ")
+    for (const a of sub.slice(1)) {
+      if (/^(--force|--force-with-lease|--force-if-includes|-f|--mirror|--delete|-d|--all|--prune)(=|$)/.test(a) || /^-[a-zA-Z]*f/.test(a)) return `"${shown}" uses ${a}`
+      if (a.startsWith("+")) return `"${shown}" force-pushes through the refspec ${a}`
       if (a.startsWith("-")) continue
       const dst = a.includes(":") ? a.slice(a.lastIndexOf(":") + 1) : a
-      if (dst === base || dst === `refs/heads/${base}`) return `"${m[0].trim()}" pushes to the base branch ${base}`
+      if (dst === base || dst === `refs/heads/${base}`) return `"${shown}" pushes to the base branch ${base}`
     }
   }
   return null
@@ -166,9 +268,38 @@ export interface GuardContext {
   worktreeParent?: string
 }
 
+const REVIEW_TMP = /^\/tmp\/review-[\w.-]+$/
+
+/** The reviewer's shell is read-only; the hook re-checks the few write-ish commands its static rules allow. */
+function reviewerShellProblem(argv: string[], cfg: TaskflowConfig): string | null {
+  const shown = argv.join(" ")
+  if (argv[0] === "gh" && argv[1] === "api") {
+    const ok = argv.length === 5 && argv[2] === "-X" && argv[3] === "PUT" && /^repos\/[\w.-]+\/[\w.-]+\/pulls\/\d+\/update-branch$/.test(argv[4]!)
+    if (!ok) return `the reviewer may only call "gh api -X PUT repos/<owner>/<repo>/pulls/<n>/update-branch"; got "${shown}"`
+  }
+  if (argv[0] === "gh" && argv[1] === "pr" && argv[2] === "merge") {
+    const allowed = [/^gh pr merge \d+ --disable-auto$/]
+    if (cfg.review.autoMerge) allowed.push(new RegExp(`^gh pr merge \\d+ --${cfg.review.mergeMethod} --auto$`))
+    if (!allowed.some((re) => re.test(shown))) {
+      return `the reviewer may only run "gh pr merge <n> --${cfg.review.mergeMethod} --auto" or "gh pr merge <n> --disable-auto"${cfg.review.autoMerge ? "" : " (auto-merge is disabled: only --disable-auto)"}; got "${shown}"`
+    }
+  }
+  if (argv[0] === "git") {
+    const sub = gitSubcommand(argv)
+    if (sub[0] === "worktree" && (sub[1] === "add" || sub[1] === "remove")) {
+      const target = sub.slice(2).find((a) => !a.startsWith("-"))
+      if (!target || !REVIEW_TMP.test(target) || sub.includes("--force") || sub.includes("-f")) {
+        return `the reviewer may only add/remove its own throwaway worktrees /tmp/review-<n> (no --force); got "${shown}"`
+      }
+    }
+  }
+  return null
+}
+
 /**
  * Hard guard evaluated on permission decisions of taskflow roles. Returns a denial reason or null. It only tightens
- * (never turns a deny into an allow). Shell analysis is best effort: commands are matched as text.
+ * (never turns a deny into an allow). Shell analysis parses shell words of each simple command (best effort: no
+ * expansion, aliases or scripts are followed).
  */
 export function guard(cfg: TaskflowConfig, ev: GuardEvent, ctx: GuardContext): string | null {
   const role = ROLES.find((r) => agentName(cfg, r) === ev.agent)
@@ -181,20 +312,14 @@ export function guard(cfg: TaskflowConfig, ev: GuardEvent, ctx: GuardContext): s
     for (const cmd of ev.resources) {
       const push = badPush(cmd, ctx.base)
       if (push) return `taskflow: ${push}; never push to ${ctx.base} or rewrite history`
-      for (const merge of mergeCommands(cmd)) {
-        if (role !== "reviewer") return `taskflow: only the reviewer enables merges (after VERDICT: LGTM); ${agentName(cfg, role)} may not run "${merge}"`
-        const allowed = [/^gh pr merge \d+ --disable-auto$/]
-        if (cfg.review.autoMerge) allowed.push(new RegExp(`^gh pr merge \\d+ --${cfg.review.mergeMethod} --auto$`))
-        if (!allowed.some((re) => re.test(merge))) {
-          return `taskflow: the reviewer may only run "gh pr merge <n> --${cfg.review.mergeMethod} --auto" or "gh pr merge <n> --disable-auto"${cfg.review.autoMerge ? "" : " (auto-merge is disabled: only --disable-auto)"}; got "${merge}"`
-        }
-      }
       if (role === "reviewer") {
-        for (const m of cmd.matchAll(/\bgh\s+api\b[^;&|\n'"`)]*/g)) {
-          if (!/^gh api -X PUT repos\/[\w.-]+\/[\w.-]+\/pulls\/\d+\/update-branch$/.test(m[0].trim())) {
-            return `taskflow: the reviewer may only call "gh api -X PUT repos/<owner>/<repo>/pulls/<n>/update-branch"; got "${m[0].trim()}"`
-          }
+        for (const argv of simpleCommands(cmd)) {
+          const problem = reviewerShellProblem(argv, cfg)
+          if (problem) return `taskflow: ${problem}`
         }
+      } else {
+        const merge = mergeCommands(cmd)[0]
+        if (merge) return `taskflow: only the reviewer enables merges (after VERDICT: LGTM); ${agentName(cfg, role)} may not run "${merge}"`
       }
     }
   }

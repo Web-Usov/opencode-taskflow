@@ -145,4 +145,20 @@ run --agent implementer "1) Try to call the tool tf_dispatch with role reviewer 
 [[ ! -f "$WT/epics/E-98-x.md" ]] || fail "implementer wrote a protected path inside the worktree"
 ok "absolute protected path inside the worktree stayed untouched"
 
+echo "--- live: /tf-next T-002 runs the claim in code, switches to the implementer and moves the session"
+sed 's/T-001/T-002/g; s/hello-file/bye-file/; s/Add hello file/Add bye file/; s/hello.txt/bye.txt/g' tasks/T-001-hello-file.md > tasks/T-002-bye-file.md
+sed -i 's/^status: .*/status: todo/; s/^branch: .*/branch: null/' tasks/T-002-bye-file.md
+git add -A && git commit -qm "docs(tasks): add T-002" && git push -q origin main
+SID="$(opencode api post /api/session -d "{\"location\":{\"directory\":\"$APP\"},\"model\":{\"providerID\":\"${LIVE_MODEL%%/*}\",\"id\":\"${LIVE_MODEL#*/}\"}}" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("data",d)["id"])')"
+opencode api post "/api/session/$SID/command" -d '{"name":"tf-next","text":"T-002"}' >/dev/null
+sleep 15
+opencode api get "/api/session/$SID" | python3 -c "
+import json,sys
+d=json.load(sys.stdin); d=d.get('data',d)
+assert d.get('agent')=='implementer', d.get('agent')
+assert d['location']['directory'].endswith('/app-wt/t-002-bye-file'), d['location']
+" || fail "/tf-next did not switch/move the session"
+opencode api post "/api/session/$SID/interrupt" -d '{}' >/dev/null 2>&1 || true
+ok "/tf-next claimed T-002, switched to implementer and moved into the worktree"
+
 echo "PASS (live). Workdir: $WORK"

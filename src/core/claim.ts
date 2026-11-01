@@ -2,7 +2,7 @@ import fs from "node:fs"
 import path from "node:path"
 import { taskIdRe, type CopySpec, type TaskflowConfig } from "../config.ts"
 import { asList, asString, parseFrontmatter } from "./frontmatter.ts"
-import { baseRefOf, detectBaseBranch, git, hasRemote, mainCheckout, NET_TIMEOUT, run, runShell, tryGit } from "./git.ts"
+import { baseRefOf, detectBaseBranch, fetchShared, git, hasRemote, mainCheckout, NET_TIMEOUT, run, runShell, tryGit } from "./git.ts"
 import { setStatus, writeBoard } from "./tasks.ts"
 
 // ---------- ids ----------
@@ -95,8 +95,8 @@ async function fetchRemote(mainDir: string, cfg: TaskflowConfig, log: string[], 
     log.push("offline: skipped git fetch")
     return null
   }
-  const f = await run("git", ["fetch", remote], mainDir, { timeout: NET_TIMEOUT, signal })
-  if (!f.ok) return `git fetch ${remote} failed (${f.stderr.trim()}); fix the remote access or pass offline=true to use local refs`
+  const f = await fetchShared(mainDir, remote, { signal })
+  if (!f.ok) return `git fetch ${remote} failed (${f.error}); fix the remote access or pass offline=true to use local refs`
   log.push(`git fetch ${remote}`)
   return null
 }
@@ -207,7 +207,13 @@ export async function claim(input: ClaimInput): Promise<ClaimResult> {
 
   fs.mkdirSync(path.dirname(wtPath), { recursive: true })
   const add = await run("git", ["worktree", "add", wtPath, "-b", branch, baseRef], mainDir, { timeout: NET_TIMEOUT })
-  if (!add.ok) return fail(`git worktree add failed: ${add.stderr.trim()}`)
+  if (!add.ok) {
+    // a killed/failed add may leave a half-made worktree and branch behind
+    await run("git", ["worktree", "remove", "--force", wtPath], mainDir)
+    await run("git", ["worktree", "prune"], mainDir)
+    if (tryGit(["branch", "--list", branch], mainDir)) await run("git", ["branch", "-D", branch], mainDir)
+    return fail(`git worktree add failed: ${add.stderr.trim()}`)
+  }
   log.push(`worktree ${wtPath} on ${branch}`)
 
   try {
@@ -275,16 +281,25 @@ export async function planWorktree(input: { cwd: string; cfg: TaskflowConfig; sl
   const existing = (tryGit(["worktree", "list", "--porcelain"], mainDir) ?? "").split("\n\n").find((b) => b.includes(`branch refs/heads/${branch}\n`) || b.endsWith(`branch refs/heads/${branch}`))
   if (existing) {
     const p = existing.match(/^worktree (.*)$/m)?.[1]
-    return { ok: true, branch, worktree: p, log: [`reusing worktree ${p} on ${branch}`] }
+    if (p && fs.existsSync(p) && path.resolve(p) !== path.resolve(mainDir)) return { ok: true, branch, worktree: p, log: [`reusing worktree ${p} on ${branch}`] }
+    if (p && path.resolve(p) === path.resolve(mainDir)) return { ok: false, log, error: `${branch} is checked out in the main checkout; switch it back to the base branch first` }
+    await run("git", ["worktree", "prune"], mainDir)
   }
   const fetchError = await fetchRemote(mainDir, cfg, log, !!input.offline, input.signal)
   if (fetchError) return { ok: false, log, error: fetchError }
-  const baseRef = baseRefOf(mainDir, cfg.git.remote, detectBaseBranch(mainDir, cfg.git.remote, cfg.git.baseBranch))
+  const remote = cfg.git.remote
+  const baseRef = baseRefOf(mainDir, remote, detectBaseBranch(mainDir, remote, cfg.git.baseBranch))
   const local = tryGit(["branch", "--list", branch], mainDir)
+  const onRemote = tryGit(["rev-parse", "--verify", "--quiet", `refs/remotes/${remote}/${branch}`], mainDir)
   fs.mkdirSync(path.dirname(wtPath), { recursive: true })
-  const add = await run("git", local ? ["worktree", "add", wtPath, branch] : ["worktree", "add", wtPath, "-b", branch, baseRef], mainDir, { timeout: NET_TIMEOUT })
+  const args = local
+    ? ["worktree", "add", wtPath, branch]
+    : onRemote
+      ? ["worktree", "add", "--track", "-b", branch, wtPath, `${remote}/${branch}`]
+      : ["worktree", "add", wtPath, "-b", branch, baseRef]
+  const add = await run("git", args, mainDir, { timeout: NET_TIMEOUT })
   if (!add.ok) return { ok: false, log, error: `git worktree add failed: ${add.stderr.trim()}` }
-  log.push(`worktree ${wtPath} on ${branch}${local ? "" : ` from ${baseRef}`}`)
+  log.push(`worktree ${wtPath} on ${branch}${local ? "" : onRemote ? ` tracking ${remote}/${branch}` : ` from ${baseRef}`}`)
   return { ok: true, branch, worktree: wtPath, log }
 }
 
@@ -370,7 +385,7 @@ export async function clean(input: CleanInput): Promise<{ ok: boolean; log: stri
   }
   const remote = cfg.git.remote
   const remoteExists = hasRemote(mainDir, remote)
-  if (remoteExists) await run("git", ["fetch", remote], mainDir, { timeout: NET_TIMEOUT, signal: input.signal })
+  if (remoteExists) await fetchShared(mainDir, remote, { signal: input.signal })
   await run("git", ["worktree", "prune"], mainDir) // a worktree deleted by hand still pins its branch
   const base = detectBaseBranch(mainDir, remote, cfg.git.baseBranch)
   const baseRef = baseRefOf(mainDir, remote, base)
@@ -431,7 +446,8 @@ export async function fastForwardMain(mainDir: string, base: string, baseRef: st
   if (baseRef === base) return "main checkout: no remote ref to fast-forward to"
   const current = tryGit(["branch", "--show-current"], mainDir)
   if (current !== base) return `main checkout is on "${current}", not ${base}: update it by hand`
-  if (tryGit(["status", "--porcelain"], mainDir)) return "main checkout has local changes: update it by hand (git pull --ff-only)"
+  const status = tryGit(["status", "--porcelain"], mainDir)
+  if (status === null || status) return "main checkout has local changes (or git status failed): update it by hand (git pull --ff-only)"
   const r = await run("git", ["merge", "--ff-only", baseRef], mainDir, { timeout: NET_TIMEOUT })
   return r.ok ? `main checkout fast-forwarded to ${baseRef}` : `main checkout could not fast-forward (${r.stderr.trim()}): update it by hand`
 }

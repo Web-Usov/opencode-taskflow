@@ -79,7 +79,7 @@ describe("guard", () => {
     const has = (role: any, action: string, resource: string, effect: string) =>
       roleRules(c, role, layout).some((r) => r.action === action && r.resource === resource && r.effect === effect)
     expect(has("implementer", "edit", "docs/spec/*", "deny")).toBe(true)
-    expect(has("implementer", "shell", "git push *:main*", "deny")).toBe(true)
+    expect(has("implementer", "shell", "git push *:main", "deny")).toBe(true)
     expect(has("reviewer", "shell", "*", "deny")).toBe(true)
     expect(has("reviewer", "shell", "pnpm verify*", "allow")).toBe(true)
     expect(has("reviewer", "shell", "gh pr merge * --squash --auto", "allow")).toBe(true)

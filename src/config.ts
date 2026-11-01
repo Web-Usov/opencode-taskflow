@@ -250,7 +250,18 @@ export function loadConfig(root: string, options: unknown = undefined, globalPat
   }
   const defaults = defaultConfig(human)
   let config = defaults
-  for (const l of layers) config = deepMerge(config, l)
+  for (const l of layers) {
+    config = deepMerge(config, l)
+    // within one layer `model` beats `models`; a later layer that sets only `models` overrides an earlier `model`
+    if (isPlainObject(l) && isPlainObject(l.agents)) {
+      for (const [role, a] of Object.entries(l.agents)) {
+        const merged = (config.agents as Record<string, AgentConfig | undefined>)[role]
+        if (isPlainObject(a) && "models" in a && !("model" in a) && merged) {
+          config.agents = { ...config.agents, [role]: { ...merged, model: undefined } }
+        }
+      }
+    }
+  }
   const problems = validate(config, defaults)
   if (problems.length) sources.push({ path: "(validation)", ok: false, error: problems.join("; ") })
   return { config, sources }
@@ -260,6 +271,7 @@ export function loadConfig(root: string, options: unknown = undefined, globalPat
 
 type Check = (v: unknown) => boolean
 const isStr: Check = (v) => typeof v === "string"
+const isNonEmpty: Check = (v) => typeof v === "string" && v.trim() !== ""
 const isStrOrNull: Check = (v) => v === null || typeof v === "string"
 const isStrArray: Check = (v) => Array.isArray(v) && v.every((x) => typeof x === "string")
 const isPosInt: Check = (v) => Number.isInteger(v) && (v as number) > 0
@@ -274,15 +286,15 @@ const isModelList: Check = (v) => v === undefined || isStrArray(v)
 /** Field-level schema: path -> check. A failing field is reset to its default. */
 const SCHEMA: Array<[string, Check]> = [
   ["language.human", isStr], ["language.agent", isStr],
-  ["git.remote", isStr], ["git.baseBranch", isStrOrNull], ["git.branchPrefix", isStr], ["git.worktreeDir", isStr],
-  ["paths.tasks", isStr], ["paths.epics", isStr], ["paths.board", isStr], ["paths.template", isStr],
+  ["git.remote", isNonEmpty], ["git.baseBranch", (v) => v === null || isNonEmpty(v)], ["git.branchPrefix", isNonEmpty], ["git.worktreeDir", isNonEmpty],
+  ["paths.tasks", isNonEmpty], ["paths.epics", isNonEmpty], ["paths.board", isNonEmpty], ["paths.template", isNonEmpty],
   ["task.areas", isStrArray], ["task.sizes", isStrArray], ["task.idPadding", (v) => isPosInt(v) && (v as number) <= 9],
   ["setup.copy", isCopyList], ["setup.commands", isStrArray],
   ["verify.full", isStrOrNull], ["verify.quick", isStrOrNull], ["verify.e2e", isStrOrNull],
   ["ci.checks", isStrArray], ["protected", isStrArray], ["qaPaths", isStrArray],
   ["board.header", isStrArray], ["board.epicLine", isStr], ["board.epicLink", isStr], ["board.taskLine", isStr],
   ["review.maxRounds", isPosInt], ["review.autoMerge", isBool], ["review.mergeMethod", oneOf("squash", "merge", "rebase")],
-  ["parallel", isPosInt], ["dispatch.timeoutMinutes", isPosInt], ["routing", isRouting], ["commandPrefix", isStr],
+  ["parallel", isPosInt], ["dispatch.timeoutMinutes", (v) => isPosInt(v) && (v as number) <= 1440], ["routing", isRouting], ["commandPrefix", isStr],
 ]
 
 const getPath = (o: any, p: string) => p.split(".").reduce((a, k) => (a == null ? undefined : a[k]), o)

@@ -55,9 +55,14 @@ export default define({
       }
       return loaded.config
     }
+    // base-branch detection runs git: cache the layout (it changes only with the config or the remote HEAD)
+    let layoutCache: { key: string; at: number; value: RepoLayout } | null = null
     const layout = (): RepoLayout => {
       const cfg = config()
-      return { base: detectBaseBranch(root, cfg.git.remote, cfg.git.baseBranch), mainDir, worktreeParent: worktreeParent(mainDir, cfg) }
+      if (layoutCache && layoutCache.key === stamp && Date.now() - layoutCache.at < 60_000) return layoutCache.value
+      const value = { base: detectBaseBranch(root, cfg.git.remote, cfg.git.baseBranch), mainDir, worktreeParent: worktreeParent(mainDir, cfg) }
+      layoutCache = { key: stamp, at: Date.now(), value }
+      return value
     }
     const reloadRegistrations = async () => {
       registrationsStale = false
@@ -91,7 +96,8 @@ export default define({
 
     // ---- agents ----
     await ctx.agent.transform((editor) => {
-      const cfg = loaded.config
+      const cfg = config()
+      registrationsStale = false
       let lay: RepoLayout
       try {
         lay = layout()
@@ -116,19 +122,12 @@ export default define({
       }
     })
 
-    // ---- session -> worktree ----
-    const sessionRoots = new Map<string, string>()
+    // ---- session -> worktree (not cached: sessions move, worktrees get removed) ----
     const sessionRoot = async (sessionID: string): Promise<string> => {
-      const known = sessionRoots.get(sessionID)
-      if (known) return known
       try {
-        const s: any = await ctx.session.get({ sessionID: sessionID as any } as any)
-        const dir = s?.location?.directory ?? s?.data?.location?.directory
-        if (typeof dir === "string") {
-          const r = worktreeRoot(dir) ?? dir
-          sessionRoots.set(sessionID, r)
-          return r
-        }
+        const sess: any = await ctx.session.get({ sessionID: sessionID as any } as any)
+        const dir = sess?.location?.directory ?? sess?.data?.location?.directory
+        if (typeof dir === "string") return worktreeRoot(dir) ?? dir
       } catch {
         /* fall back to the plugin instance */
       }
@@ -137,7 +136,7 @@ export default define({
 
     // ---- commands ----
     await ctx.command.transform((editor) => {
-      const cfg = loaded.config
+      const cfg = config()
       let lay: RepoLayout
       try {
         lay = layout()
@@ -158,12 +157,28 @@ export default define({
                 ? `CLAIMED ${r.id}: worktree ${r.worktree}, branch ${r.branch}.\n${r.log.map((l) => `  ${l}`).join("\n")}`
                 : `CLAIM FAILED for ${args.trim()}: ${r.error}\n${r.log.map((l) => `  ${l}`).join("\n")}`
               if (r.ok && r.worktree) {
-                await ctx.session.move({ sessionID: sessionID as any, directory: r.worktree as any } as any).catch(() => {})
-                sessionRoots.set(sessionID, r.worktree)
+                // switch first: the agent exists in this location; the worktree location may not have booted yet
                 switchTo = "implementer"
+                const switched = await ctx.session.switchAgent({ sessionID, agent: agentName(config(), switchTo) as any }).then(
+                  () => null,
+                  (e: unknown) => String((e as Error)?.message ?? e),
+                )
+                if (switched) report += `\nNOTE: could not switch this session to the implementer agent (${switched}).`
+                switchTo = undefined
+                const moved = await ctx.session.move({ sessionID: sessionID as any, directory: r.worktree as any } as any).then(
+                  () => null,
+                  (e: unknown) => String((e as Error)?.message ?? e),
+                )
+                if (moved) report += `\nNOTE: this session could not be moved into ${r.worktree} (${moved}); pass that directory to every tool and shell command.`
               }
             }
-            if (switchTo) await ctx.session.switchAgent({ sessionID, agent: agentName(config(), switchTo) as any }).catch(() => {})
+            if (switchTo) {
+              const err = await ctx.session.switchAgent({ sessionID, agent: agentName(config(), switchTo) as any }).then(
+                () => null,
+                (e: unknown) => String((e as Error)?.message ?? e),
+              )
+              if (err) report = `${report ?? ""}\nNOTE: could not switch this session to ${agentName(config(), switchTo)} (${err}).`
+            }
             await ctx.session.prompt({ ...(prompt as any), sessionID, text: spec.render(args, report), delivery } as any)
           },
         })
@@ -182,7 +197,8 @@ export default define({
         const doc = loadTasks(wt ?? root, cfg).find((d) => asString(d.data?.id) === input.task)
         if (doc) task = info(doc)
       }
-      const directory = input.directory ? path.resolve(input.directory) : (wt ?? mainDir)
+      // the reviewer reads the PR through git and never works inside the implementer's worktree
+      const directory = input.directory ? path.resolve(mainDir, input.directory) : input.role === "reviewer" ? mainDir : (wt ?? mainDir)
       const { chain, category } = dispatchChain(cfg, input.role, task)
       if (!available.length) await refreshModels()
       const model = resolveChain(chain, available).model
@@ -205,6 +221,10 @@ export default define({
           sessionID = id
         }
         const sid = sessionID
+        if (input.signal.aborted) {
+          await ctx.session.interrupt({ sessionID: sid as any } as any).catch(() => {})
+          throw new Error("aborted")
+        }
         const header = [input.task ? `Task: ${input.task}` : "", `Working directory: ${directory} (run every shell command there).`].filter(Boolean).join("\n")
         let timedOut = false
         const interrupt = () => void ctx.session.interrupt({ sessionID: sid as any } as any).catch(() => {})
@@ -251,7 +271,7 @@ export default define({
     let roots: string[] = []
     let rootsAt = 0
     await ctx.permission.hook("evaluate", (ev) => {
-      if (ev.effect === "deny") return
+      if (ev.effect === "deny" || (ev.action !== "edit" && ev.action !== "shell")) return
       syncRegistrations()
       const cfg = loaded.config
       if (!ROLES.some((r) => agentName(cfg, r) === String(ev.agent))) return

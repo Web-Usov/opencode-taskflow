@@ -15,8 +15,11 @@ export interface RunOptions {
   env?: Record<string, string>
 }
 
-/** Network/process calls never prompt: a credential or host-key prompt would hang the OpenCode server forever. */
-const NON_INTERACTIVE = { GIT_TERMINAL_PROMPT: "0", GH_PROMPT_DISABLED: "1", GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND ?? "ssh -o BatchMode=yes" }
+/**
+ * Calls never prompt: a credential prompt would hang forever. Processes also start in their own session (detached), so
+ * ssh has no terminal to ask on; the user's own ssh settings (core.sshCommand, GIT_SSH) stay untouched.
+ */
+const NON_INTERACTIVE = { GIT_TERMINAL_PROMPT: "0", GH_PROMPT_DISABLED: "1" }
 
 /**
  * Runs a command asynchronously without a shell. Never throws. Plugin code runs inside the OpenCode server, so anything
@@ -29,7 +32,8 @@ export function run(cmd: string, args: string[], cwd: string, opts: RunOptions =
     let stderr = ""
     let settled = false
     let killed = false
-    const child = spawn(cmd, args, { cwd, env: { ...process.env, ...NON_INTERACTIVE, ...opts.env }, stdio: ["ignore", "pipe", "pipe"] })
+    // detached: own process group, so a timeout/abort can kill the whole tree (e.g. `pnpm install` and its children)
+    const child = spawn(cmd, args, { cwd, env: { ...process.env, ...NON_INTERACTIVE, ...opts.env }, stdio: ["ignore", "pipe", "pipe"], detached: true })
     const finish = (r: RunResult) => {
       if (settled) return
       settled = true
@@ -37,19 +41,39 @@ export function run(cmd: string, args: string[], cwd: string, opts: RunOptions =
       opts.signal?.removeEventListener("abort", onAbort)
       resolve(r)
     }
+    const signalGroup = (sig: NodeJS.Signals) => {
+      try {
+        if (child.pid) process.kill(-child.pid, sig)
+      } catch {
+        try {
+          child.kill(sig)
+        } catch {
+          /* already gone */
+        }
+      }
+    }
     const kill = (why: string) => {
+      if (killed) return
       killed = true
       stderr += `\n${why}`
-      child.kill("SIGTERM")
-      setTimeout(() => child.kill("SIGKILL"), 5000).unref()
+      signalGroup("SIGTERM")
+      setTimeout(() => signalGroup("SIGKILL"), 3000).unref()
+      // do not wait for grandchildren that keep the pipes open
+      setTimeout(() => finish({ ok: false, code: null, stdout, stderr }), 3500).unref()
     }
     const onAbort = () => kill("aborted")
     opts.signal?.addEventListener("abort", onAbort, { once: true })
     const timer = opts.timeout ? setTimeout(() => kill(`timed out after ${opts.timeout} ms`), opts.timeout) : undefined
-    child.stdout.on("data", (d) => (stdout += d))
-    child.stderr.on("data", (d) => (stderr += d))
+    child.stdout.setEncoding("utf8")
+    child.stderr.setEncoding("utf8")
+    child.stdout.on("data", (d: string) => (stdout += d))
+    child.stderr.on("data", (d: string) => (stderr += d))
     child.on("error", (e) => finish({ ok: false, code: null, stdout, stderr: `${stderr}${e.message}` }))
     child.on("close", (code) => finish({ ok: code === 0 && !killed, code, stdout, stderr }))
+    // a killed command may leave grandchildren holding the pipes: resolve on exit after a short grace period
+    child.on("exit", (code) => {
+      if (killed) setTimeout(() => finish({ ok: false, code, stdout, stderr }), 200).unref()
+    })
   })
 }
 
@@ -129,3 +153,23 @@ export function baseRefOf(cwd: string, remote: string, base: string): string {
 }
 
 export const hasRemote = (cwd: string, remote: string) => tryGit(["remote", "get-url", remote], cwd) !== null
+
+/**
+ * One `git fetch` per repository at a time: concurrent callers join the running fetch (parallel fetches fight over ref
+ * locks). Read-only callers may also reuse a successful fetch younger than `maxAgeMs`.
+ */
+const fetches = new Map<string, { at: number; done: boolean; pending: Promise<{ ok: boolean; error?: string }> }>()
+export function fetchShared(mainDir: string, remote: string, opts: { maxAgeMs?: number; signal?: AbortSignal } = {}): Promise<{ ok: boolean; error?: string }> {
+  const key = `${mainDir}\u0000${remote}`
+  const prev = fetches.get(key)
+  if (prev && (!prev.done || Date.now() - prev.at < (opts.maxAgeMs ?? 0))) return prev.pending
+  const entry = { at: Date.now(), done: false, pending: Promise.resolve({ ok: true }) as Promise<{ ok: boolean; error?: string }> }
+  entry.pending = run("git", ["fetch", remote], mainDir, { timeout: NET_TIMEOUT, signal: opts.signal }).then((r) => {
+    entry.done = true
+    entry.at = Date.now()
+    if (!r.ok) fetches.delete(key)
+    return r.ok ? { ok: true } : { ok: false, error: r.stderr.trim().split("\n").pop() || "error" }
+  })
+  fetches.set(key, entry)
+  return entry.pending
+}

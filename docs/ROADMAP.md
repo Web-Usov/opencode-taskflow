@@ -9,6 +9,11 @@
 
 ## Next
 
+- **Live PR loop test** against a throwaway GitHub repository (ship → review → auto-merge → clean); today the e2e script
+  covers everything up to the push, the PR/merge part is covered by unit tests and prompts only.
+- **Event-driven model refresh** (`ctx.event.subscribe` on provider/model updates) instead of fixed retries; skip
+  `status: deprecated` models.
+
 - **Runtime model fallback**: use the `session.hook("retry")` to switch a child session to the next model of its chain
   on rate limits / provider errors (OMO's `runtime_fallback`).
 - **Spec coverage tool** (`tf_spec`): rule-id definitions, dangling references, test coverage report (finance

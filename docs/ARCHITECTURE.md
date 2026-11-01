@@ -45,6 +45,25 @@ scripts/e2e.sh         loads the plugin into the running OpenCode service and as
    model registry changes). The model list is refreshed at setup and once more 3 s later because provider plugins may
    register after this plugin's setup.
 
+10. **Nothing slow runs synchronously in the server.** Plugin code shares the OpenCode server's event loop: fetch, push,
+    gh and setup commands go through the async `run` (own process group, killed as a group on timeout/abort, no prompts:
+    `GIT_TERMINAL_PROMPT=0`, detached session). Only millisecond-scale local git queries are synchronous.
+11. **One fetch per repository at a time.** `fetchShared` joins a running fetch (parallel fetches fight over ref locks);
+    read-only tools reuse a fetch younger than 45 s. A claim fails when its fetch fails (stale refs could double-claim).
+12. **Guard = static rules + hook.** Static rules (OpenCode wildcards: `*` matches `/` and spaces) cover relative paths
+    and the main checkout; absolute paths inside worktrees are resolved by the hook (`relativize`), because a static
+    `<parent>/*/<glob>` would match at any depth. Shell commands are parsed into shell words per simple command
+    (unwrapping `env`, `sudo`, `bash -c`), so quoted text (`git commit -m "... gh pr merge ..."`, `grep`) is not a
+    false positive and `git -c k=v push origin HEAD:main` is not a bypass. Still best effort: no expansion or aliases.
+13. **Tool permissions per role.** Each tf_* tool has `options.permission` (`taskflow.read|write|dispatch`); role rules
+    deny `taskflow.dispatch` to everyone but the lead and `taskflow.write` to reviewer and qa, which hides the tools.
+    `tf_dispatch` also refuses taskflow callers other than the lead.
+14. **Session-relative tools.** Task-file tools default to the calling session's worktree (`session.get`, not cached:
+    sessions move and worktrees are removed). `/tf-next T-xxx` claims in code, switches the session to the implementer
+    *before* moving it into the worktree (the new location may not have booted the plugin yet), then prompts.
+15. **Planner worktrees.** `tf_start plan=<slug>` creates or reuses `plan/<slug>` (tracking the remote branch if only
+    that exists); the planner child runs there, so its edits are relative and its static allow rules apply.
+
 ## Borrowed from oh-my-openagent
 
 Role/category model chains with first-available resolution, size/area routing for implementer work, a doctor view of
