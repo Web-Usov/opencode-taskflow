@@ -11,7 +11,11 @@ oh-my-openagent) и ограничения прав — одной строко�
 | **Роли-агенты** | `lead` (оркестратор), `planner`, `implementer`, `reviewer`, `qa`. Промпты собираются из конфига проекта (команда проверки, защищённые пути, ветка, язык). Модель — первая доступная из цепочки. Права — по роли. |
 | **Инструменты `tf_*`** | `tf_status`, `tf_next`, `tf_task`, `tf_start` (worktree + ветка + env + claim-коммит), `tf_set`, `tf_check`, `tf_board`, `tf_clean`, `tf_models` (doctor), `tf_dispatch` (запуск роли дочерней сессией), `tf_init`. |
 | **Команды** | `/tf-next`, `/tf-ship`, `/tf-review`, `/tf-handoff`, `/tf-status`, `/tf-plan`, `/tf-drive`, `/tf-milestone`, `/tf-init`, `/tf-doctor`. |
-| **Guard** | Хук прав: никто, кроме planner, не правит защищённые пути; никто, кроме reviewer, не запускает `gh pr merge`. Работает, даже если файл агента в проекте переопределил права. |
+| **Guard** | Статические правила по ролям + хук прав: правки защищённых путей (и по относительным, и по абсолютным путям в worktree) — только planner; `gh pr merge` и `gh api …/merge` — только reviewer и только в точной форме `gh pr merge <n> --squash --auto` / `--disable-auto`; никто не пушит в основную ветку и не переписывает историю (`--force`, `+refspec`, `HEAD:main`). Инструменты тоже по ролям: `tf_dispatch` — только lead и сессия человека, «пишущие» `tf_*` скрыты от reviewer и qa. |
+
+**Граница гарантий.** Проверки shell-команд — по тексту команды (best effort): изменение файла через `sed -i` или
+`echo > file` хук прав не видит. Жёсткий шлюз — защита ветки и обязательные проверки CI на GitHub; плагин делает
+нарушения маловероятными и заметными, но не заменяет их.
 
 Процесс целиком описан в контракте, который получает каждая роль (`src/roles.ts`, функция `contract`), и в
 `docs/taskflow.md`, который создаёт `/tf-init`.
@@ -39,9 +43,11 @@ git clone git@github.com:Web-Usov/opencode-taskflow.git ~/plugins/opencode-taskf
    README эпиков, пример эпика, шаблоны PR, `docs/taskflow.md`, секцию в `AGENTS.md` и доску задач. Ничего не перезаписывает.
 2. Поправьте `.opencode/taskflow.jsonc` (команды проверки, обязательные CI-проверки, защищённые пути, области задач,
    env-файлы для worktree) и закоммитьте.
-3. `/tf-plan E-01` — planner раскладывает эпик на задачи (PR на ревью человеку).
-4. `/tf-next` → `/tf-next T-001` — взять задачу в работу руками, или `/tf-drive` — оркестратор сам ведёт готовые задачи
-   до слияния: implementer → reviewer → доработка (до `review.maxRounds` кругов) → слияние → `tf_clean`.
+3. `/tf-plan E-01` — planner в своём worktree `plan/<slug>` раскладывает эпик на задачи (PR на ревью человеку).
+4. `/tf-next` — список готовых задач с рекомендацией. `/tf-next T-001` — захват задачи кодом (worktree, ветка,
+   `in_progress`, claim-коммит), сессия переезжает в worktree и переключается на агента `implementer`.
+   Или `/tf-drive` — оркестратор сам ведёт готовые задачи до слияния: implementer → reviewer → доработка
+   (до `review.maxRounds` кругов) → ожидание слияния → `tf_clean` (он же подтягивает основную ветку).
 5. `/tf-status` и `/tf-doctor` — состояние доски, PR, CI и какие модели выбраны для ролей.
 
 ## Конфигурация
@@ -67,11 +73,12 @@ git clone git@github.com:Web-Usov/opencode-taskflow.git ~/plugins/opencode-taskf
   "spec": null,                                          // или { dir, definition, questions, questionPattern, acceptancePattern }
   "review": { "maxRounds": 3, "autoMerge": true, "mergeMethod": "squash" },
   "parallel": 2,                                         // максимум одновременных implementer'ов в /tf-drive
+  "dispatch": { "timeoutMinutes": 180 },                 // дочерняя сессия прерывается по таймауту
   "agents": {                                            // цепочки: первая доступная модель побеждает
     "implementer": { "models": ["claude-code/claude-opus-5-5#medium", "anthropic/claude-opus-5-5#medium"] },
     "reviewer":    { "models": ["openai/gpt-6-astra#high", "claude-code/claude-opus-5-5#high"] },
     "qa":          { "disable": true }
-    // также: name (id агента), model, permissions (доп. правила)
+    // также: name (id агента), model (одна модель; важнее цепочки models), permissions (доп. правила)
   },
   "categories": { "quick": { "models": ["claude-code/claude-sonnet-5-5#medium"] } },
   "routing": [ { "when": { "size": "S" }, "category": "quick" } ],   // модель implementer'а по размеру/области задачи
@@ -79,7 +86,9 @@ git clone git@github.com:Web-Usov/opencode-taskflow.git ~/plugins/opencode-taskf
 }
 ```
 
-Полные значения по умолчанию — `defaultConfig()` в `src/config.ts`.
+Полные значения по умолчанию — `defaultConfig()` в `src/config.ts`. Неверные значения (не тот тип, неизвестный
+`mergeMethod`, битое регулярное выражение в `spec`) заменяются значениями по умолчанию по одному полю, а проблема
+видна в `/tf-doctor`. Файлы конфига перечитываются при изменении, роли перерегистрируются автоматически.
 
 ### Модели
 

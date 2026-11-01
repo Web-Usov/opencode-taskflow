@@ -60,11 +60,18 @@ echo "$agents" | python3 -c "
 import json,sys
 a=[x for x in json.load(sys.stdin)['data'] if x['id']=='implementer'][0]
 assert {'action':'edit','resource':'docs/spec/*','effect':'deny'} in a['permissions']
-assert {'action':'shell','resource':'gh pr merge *','effect':'deny'} in a['permissions']
+assert {'action':'shell','resource':'gh pr merge*','effect':'deny'} in a['permissions']
 " || fail "implementer permissions"
 ok "implementer permissions deny protected edits and merges"
 
 cmds="$(opencode api get "/api/command?$Q")"
+echo "$agents" | python3 -c "
+import json,sys
+a=[x for x in json.load(sys.stdin)['data'] if x['id']=='implementer'][0]
+assert {'action':'taskflow.dispatch','resource':'*','effect':'deny'} in a['permissions']
+" || fail "implementer may dispatch"
+ok "implementer cannot dispatch other agents"
+
 for c in tf-next tf-ship tf-review tf-handoff tf-status tf-plan tf-drive tf-milestone tf-init tf-doctor; do
   echo "$cmds" | grep -q "\"$c\"" || fail "command $c missing"
 done
@@ -132,5 +139,10 @@ WT="$WORK/app-wt/t-001-hello-file"
 [[ "$(cat "$WT/hello.txt" 2>/dev/null)" == "hello" ]] || fail "implementer did not create hello.txt in the worktree"
 git -C "$WT" log -1 --format=%s | grep -q "T-001" || fail "implementer commit missing"
 ok "worktree claimed and implementer committed in it"
+
+echo "--- live: implementer cannot dispatch, guard covers absolute worktree paths"
+run --agent implementer "1) Try to call the tool tf_dispatch with role reviewer and prompt 'x' and report the exact result. 2) Use your write tool to create the file $WT/epics/E-98-x.md (absolute path) with content 'x' and report whether it was allowed."
+[[ ! -f "$WT/epics/E-98-x.md" ]] || fail "implementer wrote a protected path inside the worktree"
+ok "absolute protected path inside the worktree stayed untouched"
 
 echo "PASS (live). Workdir: $WORK"
