@@ -5,20 +5,22 @@
  *   A project agent file with the same name overrides any field it defines.
  * - Registers deterministic tools (`tf_*`) for the task system and the `tf_dispatch` orchestration primitive.
  * - Registers slash commands (`/tf-next`, `/tf-ship`, `/tf-review`, ...).
- * - Guards protected paths and merges with a permission hook.
+ * - Guards protected paths, merges and pushes to the base branch with a permission hook.
  *
  * Only types are imported from `@opencode/plugin`, so the plugin has no runtime dependencies.
  */
+import path from "node:path"
 import type { Plugin } from "@opencode/plugin"
-import { agentName, loadConfig, ROLES, type LoadedConfig, type Role } from "./config.ts"
+import { agentChain, agentName, configStamp, loadConfig, ROLES, type LoadedConfig, type Role, type TaskflowConfig } from "./config.ts"
 import { commandSpecs } from "./commands.ts"
-import { detectBaseBranch, worktreeRoot } from "./core/git.ts"
-import { guard, roleRules } from "./core/guard.ts"
-import { resolveChain, type AvailableModel } from "./core/models.ts"
+import { claim, worktreeParent } from "./core/claim.ts"
 import { asString } from "./core/frontmatter.ts"
+import { detectBaseBranch, mainCheckout, worktreePaths, worktreeRoot } from "./core/git.ts"
+import { guard, roleRules, type RepoLayout } from "./core/guard.ts"
+import { resolveChain, type AvailableModel } from "./core/models.ts"
 import { info, loadTasks } from "./core/tasks.ts"
 import { ROLE_DESCRIPTIONS, roleMode, rolePrompt } from "./roles.ts"
-import { buildTools, dispatchChain, lastAssistantText, taskWorktree, type DispatchInput, type DispatchResult } from "./tools.ts"
+import { buildTools, childResult, dispatchChain, taskWorktree, type DispatchInput, type DispatchResult } from "./tools.ts"
 
 type Ctx = Plugin.Context
 
@@ -26,16 +28,45 @@ const define = (p: Plugin.Plugin): Plugin.Plugin => p
 
 export const PLUGIN_ID = "taskflow"
 
+const modelRef = (m: { providerID: string; id: string; variant?: string }) => ({ providerID: m.providerID, id: m.id, ...(m.variant ? { variant: m.variant } : {}) })
+const modelString = (m: { providerID: string; id: string; variant?: string } | null) => (m ? `${m.providerID}/${m.id}${m.variant ? `#${m.variant}` : ""}` : null)
+
 export default define({
   id: PLUGIN_ID,
   async setup(ctx: Ctx) {
     const root = worktreeRoot(ctx.location.directory) ?? ctx.location.directory
+    let mainDir = root
+    try {
+      mainDir = mainCheckout(root)
+    } catch {
+      /* not a git repository: the task tools report it */
+    }
+
+    // ---- config (re-read when the files change) ----
     let loaded: LoadedConfig = loadConfig(root, ctx.options)
-    const config = () => {
-      loaded = loadConfig(root, ctx.options)
+    let stamp = configStamp(root)
+    let registrationsStale = false
+    const config = (): TaskflowConfig => {
+      const now = configStamp(root)
+      if (now !== stamp) {
+        stamp = now
+        loaded = loadConfig(root, ctx.options)
+        registrationsStale = true
+      }
       return loaded.config
     }
-    const baseBranch = () => detectBaseBranch(root, loaded.config.git.remote, loaded.config.git.baseBranch)
+    const layout = (): RepoLayout => {
+      const cfg = config()
+      return { base: detectBaseBranch(root, cfg.git.remote, cfg.git.baseBranch), mainDir, worktreeParent: worktreeParent(mainDir, cfg) }
+    }
+    const reloadRegistrations = async () => {
+      registrationsStale = false
+      await Promise.all([ctx.agent.reload(), ctx.command.reload()])
+    }
+    const syncRegistrations = () => {
+      config()
+      if (registrationsStale) void reloadRegistrations().catch(() => {})
+    }
 
     // ---- available models (for chain resolution) ----
     let available: AvailableModel[] = []
@@ -44,7 +75,9 @@ export default define({
       try {
         const res: any = await ctx.model.list()
         const list: any[] = Array.isArray(res) ? res : (res?.data ?? [])
-        const next = list.map((m) => ({ providerID: String(m.providerID), id: String(m.id), variants: (m.variants ?? []).map((v: any) => ({ id: String(v.id) })) }))
+        const next = list
+          .filter((m) => m.enabled !== false)
+          .map((m) => ({ providerID: String(m.providerID), id: String(m.id), variants: (m.variants ?? []).map((v: any) => ({ id: String(v.id) })) }))
         const key = next.map((m) => `${m.providerID}/${m.id}`).sort().join(",")
         available = next
         if (key !== modelsKey) {
@@ -59,32 +92,79 @@ export default define({
     // ---- agents ----
     await ctx.agent.transform((editor) => {
       const cfg = loaded.config
-      const base = baseBranch()
+      let lay: RepoLayout
+      try {
+        lay = layout()
+      } catch {
+        return
+      }
       for (const role of ROLES) {
-        const a = cfg.agents[role]
-        if (a?.disable) continue
-        const name = agentName(cfg, role)
-        const model = resolveChain(a?.models ?? (a?.model ? [a.model] : []), available).model
-        editor.update(name, (agent: any) => {
-          agent.description = ROLE_DESCRIPTIONS[role]
-          agent.mode = roleMode(role)
-          agent.system = rolePrompt(cfg, role, base)
-          if (model) agent.model = { providerID: model.providerID, id: model.id, ...(model.variant ? { variant: model.variant } : {}) }
-          agent.permissions = [...(agent.permissions ?? []), ...roleRules(cfg, role, base), ...(a?.permissions ?? [])]
-        })
+        try {
+          const a = cfg.agents[role]
+          if (a?.disable) continue
+          const model = resolveChain(agentChain(cfg, role), available).model
+          editor.update(agentName(cfg, role), (agent: any) => {
+            agent.description = ROLE_DESCRIPTIONS[role]
+            agent.mode = roleMode(role)
+            agent.system = rolePrompt(cfg, role, lay)
+            if (model) agent.model = modelRef(model)
+            agent.permissions = [...(agent.permissions ?? []), ...roleRules(cfg, role, lay), ...(a?.permissions ?? [])]
+          })
+        } catch {
+          /* one broken role must not take down the others */
+        }
       }
     })
+
+    // ---- session -> worktree ----
+    const sessionRoots = new Map<string, string>()
+    const sessionRoot = async (sessionID: string): Promise<string> => {
+      const known = sessionRoots.get(sessionID)
+      if (known) return known
+      try {
+        const s: any = await ctx.session.get({ sessionID: sessionID as any } as any)
+        const dir = s?.location?.directory ?? s?.data?.location?.directory
+        if (typeof dir === "string") {
+          const r = worktreeRoot(dir) ?? dir
+          sessionRoots.set(sessionID, r)
+          return r
+        }
+      } catch {
+        /* fall back to the plugin instance */
+      }
+      return root
+    }
 
     // ---- commands ----
     await ctx.command.transform((editor) => {
       const cfg = loaded.config
-      for (const spec of commandSpecs(cfg)) {
+      let lay: RepoLayout
+      try {
+        lay = layout()
+      } catch {
+        return
+      }
+      for (const spec of commandSpecs(cfg, lay)) {
         editor.add({
           name: spec.name,
           description: spec.description,
           execute: async ({ sessionID, prompt, delivery }) => {
-            if (spec.switchTo) await ctx.session.switchAgent({ sessionID, agent: agentName(loaded.config, spec.switchTo) as any })
-            await ctx.session.prompt({ ...(prompt as any), sessionID, text: spec.render(prompt.text ?? ""), delivery } as any)
+            const args = prompt.text ?? ""
+            let report: string | undefined
+            let switchTo: Role | undefined = spec.switchTo
+            if (spec.claimArg && args.trim()) {
+              const r = await claim({ cwd: await sessionRoot(sessionID), cfg: config(), id: args.trim() })
+              report = r.ok
+                ? `CLAIMED ${r.id}: worktree ${r.worktree}, branch ${r.branch}.\n${r.log.map((l) => `  ${l}`).join("\n")}`
+                : `CLAIM FAILED for ${args.trim()}: ${r.error}\n${r.log.map((l) => `  ${l}`).join("\n")}`
+              if (r.ok && r.worktree) {
+                await ctx.session.move({ sessionID: sessionID as any, directory: r.worktree as any } as any).catch(() => {})
+                sessionRoots.set(sessionID, r.worktree)
+                switchTo = "implementer"
+              }
+            }
+            if (switchTo) await ctx.session.switchAgent({ sessionID, agent: agentName(config(), switchTo) as any }).catch(() => {})
+            await ctx.session.prompt({ ...(prompt as any), sessionID, text: spec.render(args, report), delivery } as any)
           },
         })
       }
@@ -93,15 +173,18 @@ export default define({
     // ---- dispatch (child sessions) ----
     const running = new Map<Role, number>()
     const dispatch = async (input: DispatchInput): Promise<DispatchResult> => {
+      if (input.signal.aborted) throw new Error("aborted")
       const cfg = config()
       const agent = agentName(cfg, input.role)
       let task: { size?: string; area?: string } | null = null
+      const wt = input.task ? taskWorktree(root, cfg, input.task) : null
       if (input.task) {
-        const doc = loadTasks(root, cfg).find((d) => asString(d.data?.id) === input.task)
+        const doc = loadTasks(wt ?? root, cfg).find((d) => asString(d.data?.id) === input.task)
         if (doc) task = info(doc)
       }
-      const directory = input.directory ?? (input.task ? taskWorktree(root, cfg, input.task) : null) ?? root
+      const directory = input.directory ? path.resolve(input.directory) : (wt ?? mainDir)
       const { chain, category } = dispatchChain(cfg, input.role, task)
+      if (!available.length) await refreshModels()
       const model = resolveChain(chain, available).model
       if (input.role === "implementer" && !input.sessionID && (running.get("implementer") ?? 0) >= cfg.parallel) {
         throw new Error(`${cfg.parallel} implementer(s) already running (config "parallel"); wait for one to finish`)
@@ -113,29 +196,35 @@ export default define({
           const s: any = await ctx.session.create({
             parentID: input.parentSessionID as any,
             agent: agent as any,
-            ...(model ? { model: { providerID: model.providerID, id: model.id, ...(model.variant ? { variant: model.variant } : {}) } as any } : {}),
+            ...(model ? { model: modelRef(model) as any } : {}),
             location: { directory } as any,
             title: `${input.role}${input.task ? ` ${input.task}` : ""}${category ? ` [${category}]` : ""}`,
           })
-          sessionID = String(s?.id ?? s?.data?.id)
+          const id = s?.id ?? s?.data?.id
+          if (typeof id !== "string" || !id) throw new Error("session.create returned no session id")
+          sessionID = id
         }
-        const header = [
-          input.task ? `Task: ${input.task}` : "",
-          `Working directory: ${directory} (run every shell command there).`,
-        ]
-          .filter(Boolean)
-          .join("\n")
-        const onAbort = () => void ctx.session.interrupt({ sessionID: sessionID as any } as any).catch(() => {})
-        input.signal.addEventListener("abort", onAbort, { once: true })
+        const sid = sessionID
+        const header = [input.task ? `Task: ${input.task}` : "", `Working directory: ${directory} (run every shell command there).`].filter(Boolean).join("\n")
+        let timedOut = false
+        const interrupt = () => void ctx.session.interrupt({ sessionID: sid as any } as any).catch(() => {})
+        input.signal.addEventListener("abort", interrupt, { once: true })
+        const timer = setTimeout(() => {
+          timedOut = true
+          interrupt()
+        }, cfg.dispatch.timeoutMinutes * 60_000)
         try {
-          await ctx.session.prompt({ sessionID: sessionID as any, text: `${header}\n\n${input.prompt}` } as any)
-          await ctx.session.wait({ sessionID: sessionID as any } as any)
+          await ctx.session.prompt({ sessionID: sid as any, text: `${header}\n\n${input.prompt}` } as any)
+          if (input.signal.aborted) interrupt()
+          await ctx.session.wait({ sessionID: sid as any } as any)
         } finally {
-          input.signal.removeEventListener("abort", onAbort)
+          clearTimeout(timer)
+          input.signal.removeEventListener("abort", interrupt)
         }
-        const messages: any = await ctx.session.context({ sessionID: sessionID as any } as any)
-        const list = Array.isArray(messages) ? messages : (messages?.data ?? [])
-        return { sessionID, agent, model: model ? `${model.providerID}/${model.id}${model.variant ? `#${model.variant}` : ""}` : null, directory, text: lastAssistantText(list) }
+        const messages: any = await ctx.session.context({ sessionID: sid as any } as any)
+        const r = childResult(Array.isArray(messages) ? messages : (messages?.data ?? []))
+        const error = timedOut ? `timed out after ${cfg.dispatch.timeoutMinutes} min and was interrupted${r.error ? `; ${r.error}` : ""}` : input.signal.aborted ? "aborted by the caller" : r.error
+        return { sessionID: sid, agent, model: modelString(model), directory, text: r.text, outcome: r.outcome, error }
       } finally {
         running.set(input.role, Math.max(0, (running.get(input.role) ?? 1) - 1))
       }
@@ -144,41 +233,48 @@ export default define({
     // ---- tools ----
     await ctx.tool.transform((editor) => {
       editor.namespace({ name: "taskflow", description: "Task system and orchestration tools (opencode-taskflow)" })
-      for (const t of buildTools({
-        root: () => root,
-        config,
-        configSources: () => loaded.sources,
-        models: () => available,
-        refreshModels,
-        reloadRegistrations: async () => {
-          config()
-          await Promise.all([ctx.agent.reload(), ctx.command.reload()])
-        },
-        dispatch,
-      })) {
+      for (const t of buildTools({ root: () => root, sessionRoot, layout, config, configSources: () => loaded.sources, models: () => available, refreshModels, reloadRegistrations, dispatch })) {
         editor.add({
           name: t.name,
           description: t.description,
           input: t.input as any,
-          options: { namespace: "taskflow", codemode: false },
-          execute: async (input: any, context: any) => ({ content: await t.execute(input ?? {}, { sessionID: String(context.sessionID), signal: context.signal }) }),
+          options: { namespace: "taskflow", codemode: false, permission: t.permission },
+          execute: async (input: any, context: any) => {
+            syncRegistrations()
+            return { content: await t.execute(input ?? {}, { sessionID: String(context.sessionID), agent: context.agent ? String(context.agent) : undefined, signal: context.signal }) }
+          },
         })
       }
     })
 
     // ---- guard ----
+    let roots: string[] = []
+    let rootsAt = 0
     await ctx.permission.hook("evaluate", (ev) => {
       if (ev.effect === "deny") return
-      const reason = guard(loaded.config, { agent: ev.agent ? String(ev.agent) : undefined, action: ev.action, resources: ev.resources })
+      syncRegistrations()
+      const cfg = loaded.config
+      if (!ROLES.some((r) => agentName(cfg, r) === String(ev.agent))) return
+      if (Date.now() - rootsAt > 10_000) {
+        roots = worktreePaths(root)
+        rootsAt = Date.now()
+      }
+      let lay: RepoLayout
+      try {
+        lay = layout()
+      } catch {
+        return
+      }
+      const reason = guard(cfg, { agent: ev.agent ? String(ev.agent) : undefined, action: ev.action, resources: ev.resources }, { base: lay.base, roots: roots.length ? roots : [root], worktreeParent: lay.worktreeParent })
       if (reason) {
         ev.effect = "deny"
         ev.message = reason
       }
     })
 
-    // The model registry may fill after this plugin's setup (provider plugins load in parallel): refresh now and once more.
+    // The model registry may fill after this plugin's setup (provider plugins load in parallel, logins happen later).
     await refreshModels()
-    const timer = setTimeout(() => void refreshModels(), 3000)
-    return () => clearTimeout(timer)
+    const timers = [3_000, 15_000, 60_000].map((ms) => setTimeout(() => void refreshModels(), ms))
+    return () => timers.forEach(clearTimeout)
   },
 })

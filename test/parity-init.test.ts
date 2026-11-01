@@ -50,7 +50,7 @@ describe("init", () => {
     })
     const d = detect(main)
     expect(d).toMatchObject({ packageManager: "pnpm", verify: { full: "pnpm verify", quick: "pnpm verify:quick", e2e: "pnpm e2e:smoke" }, baseBranch: "main" })
-    const r = init(main, cfg(), "main", { human: "ru" })
+    const r = init(main, cfg(), { base: "main", mainDir: main, worktreeParent: main + "-wt" }, { human: "ru" })
     expect(r.created).toContain(".opencode/taskflow.jsonc")
     expect(r.created).toContain("tasks/_template.md")
     expect(r.created).toContain("epics/E-01-example.md")
@@ -65,7 +65,7 @@ describe("init", () => {
     const loaded = loadConfig(main, undefined, "/nonexistent").config
     expect(check(main, loaded).errors).toEqual([])
     // second run changes nothing
-    expect(init(main, cfg(), "main").created).toEqual([])
+    expect(init(main, cfg(), { base: "main", mainDir: main, worktreeParent: main + "-wt" }).created).toEqual([])
   })
 
   test("detects non-JS projects", () => {

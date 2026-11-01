@@ -1,6 +1,6 @@
 import fs from "node:fs"
 import path from "node:path"
-import type { TaskflowConfig } from "../config.ts"
+import { taskIdRe, type TaskflowConfig } from "../config.ts"
 import { asList, asString, parseFrontmatter, sectionBody, setField, type Frontmatter } from "./frontmatter.ts"
 import { tryGit } from "./git.ts"
 
@@ -33,6 +33,20 @@ function loadDir(root: string, dir: string, filter: RegExp): Doc[] {
 }
 
 export const loadTasks = (root: string, cfg: TaskflowConfig) => loadDir(root, cfg.paths.tasks, /^T-.*\.md$/)
+
+/** Task files as committed on a ref (e.g. `origin/main`), so readiness reflects merged work without a pull. */
+export function loadTasksFromRef(root: string, cfg: TaskflowConfig, ref: string): Doc[] | null {
+  const list = tryGit(["ls-tree", "--name-only", ref, `${cfg.paths.tasks}/`], root)
+  if (list === null) return null
+  return list
+    .split("\n")
+    .filter((f) => /^T-.*\.md$/.test(path.basename(f)))
+    .sort()
+    .map((f) => {
+      const { data, text } = parseFrontmatter(tryGit(["show", `${ref}:${f}`], root) ?? "")
+      return { file: path.join(root, f), name: path.basename(f), rel: f, data, text }
+    })
+}
 export const loadEpics = (root: string, cfg: TaskflowConfig) => loadDir(root, cfg.paths.epics, /^E-.*\.md$/)
 
 export const taskNum = (id: string) => parseInt(id.slice(2), 10)
@@ -164,6 +178,7 @@ export function check(root: string, cfg: TaskflowConfig, opts: CheckOptions = {}
   const tasks = loadTasks(root, cfg)
   const byId = new Map<string, Doc>()
   const accRe = cfg.spec ? new RegExp(cfg.spec.acceptancePattern) : null
+  const idRe = taskIdRe(cfg)
   for (const t of tasks) {
     const d = t.data
     if (!d) {
@@ -171,9 +186,9 @@ export function check(root: string, cfg: TaskflowConfig, opts: CheckOptions = {}
       continue
     }
     const id = asString(d.id) ?? ""
-    const fm = t.name.match(/^(T-\d{3,})-[a-z0-9-]+\.md$/)
+    const fm = t.name.match(new RegExp(`^(T-\\d{${cfg.task.idPadding},})-[a-z0-9-]+\\.md$`))
     if (!fm) err(t.rel, "file name must match T-NNN-slug.md")
-    if (!/^T-\d{3,}$/.test(id)) err(t.rel, `invalid id "${id}" (expected T-NNN)`)
+    if (!idRe.test(id)) err(t.rel, `invalid id "${id}" (expected T- and at least ${cfg.task.idPadding} digits)`)
     else if (fm && fm[1] !== id) err(t.rel, `file name id ${fm[1]} does not match frontmatter id ${id}`)
     if (byId.has(id)) err(t.rel, `duplicate task id ${id}`)
     byId.set(id, t)
@@ -374,7 +389,7 @@ export function setStatus(
   status: string,
   opts: { branch?: string; pr?: string } = {},
 ): string {
-  if (!/^T-\d{3,}$/.test(id)) throw new Error(`invalid task id "${id}"`)
+  if (!taskIdRe(cfg).test(id)) throw new Error(`invalid task id "${id}"`)
   if (!(TASK_STATUS as readonly string[]).includes(status)) throw new Error(`invalid status "${status}" (${TASK_STATUS.join("|")})`)
   const t = loadTasks(root, cfg).find((x) => asString(x.data?.id) === id)
   if (!t) throw new Error(`task ${id} not found in ${cfg.paths.tasks}/`)

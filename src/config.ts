@@ -63,6 +63,8 @@ export interface TaskflowConfig {
   board: { header: string[]; epicLine: string; epicLink: string; taskLine: string }
   review: { maxRounds: number; autoMerge: boolean; mergeMethod: "squash" | "merge" | "rebase" }
   parallel: number
+  /** Child sessions started by tf_dispatch. */
+  dispatch: { timeoutMinutes: number }
   agents: Partial<Record<Role, AgentConfig>>
   categories: Record<string, CategoryConfig>
   routing: RoutingRule[]
@@ -108,6 +110,7 @@ export function defaultConfig(humanLanguage = "ru"): TaskflowConfig {
     board: humanLanguage === "ru" ? BOARD_RU : BOARD_EN,
     review: { maxRounds: 3, autoMerge: true, mergeMethod: "squash" },
     parallel: 2,
+    dispatch: { timeoutMinutes: 180 },
     agents: {
       // Chains are tried in order; models your providers do not serve are skipped.
       // Reviewer deliberately prefers a different model family than the implementer (cross-model review).
@@ -129,17 +132,33 @@ export function defaultConfig(humanLanguage = "ru"): TaskflowConfig {
 
 // ---------- JSONC ----------
 
-/** Strips `//` and `/* *\/` comments and trailing commas outside of strings, then JSON.parse. */
+/**
+ * JSONC: `//` and `/* *\/` comments, trailing commas and a leading BOM, all handled outside of strings only.
+ */
 export function parseJsonc(text: string): unknown {
+  const src = text.replace(/^\uFEFF/, "")
   let out = ""
   let i = 0
   let inString = false
-  while (i < text.length) {
-    const c = text[i]!
+  /** Index in `src` after whitespace and comments starting at j. */
+  const skipTrivia = (j: number): number => {
+    for (;;) {
+      while (j < src.length && /\s/.test(src[j]!)) j++
+      if (src[j] === "/" && src[j + 1] === "/") {
+        while (j < src.length && src[j] !== "\n") j++
+      } else if (src[j] === "/" && src[j + 1] === "*") {
+        j += 2
+        while (j < src.length && !(src[j] === "*" && src[j + 1] === "/")) j++
+        j += 2
+      } else return j
+    }
+  }
+  while (i < src.length) {
+    const c = src[i]!
     if (inString) {
       out += c
       if (c === "\\") {
-        out += text[i + 1] ?? ""
+        out += src[i + 1] ?? ""
         i += 2
         continue
       }
@@ -151,18 +170,18 @@ export function parseJsonc(text: string): unknown {
       inString = true
       out += c
       i++
-    } else if (c === "/" && text[i + 1] === "/") {
-      while (i < text.length && text[i] !== "\n") i++
-    } else if (c === "/" && text[i + 1] === "*") {
-      i += 2
-      while (i < text.length && !(text[i] === "*" && text[i + 1] === "/")) i++
-      i += 2
+    } else if (c === "/" && (src[i + 1] === "/" || src[i + 1] === "*")) {
+      i = skipTrivia(i)
+    } else if (c === ",") {
+      const next = skipTrivia(i + 1)
+      if (src[next] !== "}" && src[next] !== "]") out += c
+      i++
     } else {
       out += c
       i++
     }
   }
-  return JSON.parse(out.replace(/,(\s*[}\]])/g, "$1"))
+  return JSON.parse(out)
 }
 
 // ---------- merge ----------
@@ -218,7 +237,8 @@ function readLayer(file: string, sources: ConfigSource[]): unknown {
 
 /**
  * defaults <- ~/.config/opencode/taskflow.jsonc <- <root>/.opencode/taskflow.jsonc <- plugin options.
- * The language of the defaults follows the first layer that sets `language.human`, so board texts match it.
+ * The language of the defaults follows the last (highest-precedence) layer that sets `language.human`, so board texts
+ * match it. Invalid values are replaced by their defaults field by field and reported as a `validation` source.
  */
 export function loadConfig(root: string, options: unknown = undefined, globalPath = globalConfigPath()): LoadedConfig {
   const sources: ConfigSource[] = []
@@ -228,9 +248,124 @@ export function loadConfig(root: string, options: unknown = undefined, globalPat
     const lang = isPlainObject(l) && isPlainObject(l.language) ? l.language.human : undefined
     if (typeof lang === "string") human = lang
   }
-  let config = defaultConfig(human)
+  const defaults = defaultConfig(human)
+  let config = defaults
   for (const l of layers) config = deepMerge(config, l)
+  const problems = validate(config, defaults)
+  if (problems.length) sources.push({ path: "(validation)", ok: false, error: problems.join("; ") })
   return { config, sources }
+}
+
+// ---------- validation ----------
+
+type Check = (v: unknown) => boolean
+const isStr: Check = (v) => typeof v === "string"
+const isStrOrNull: Check = (v) => v === null || typeof v === "string"
+const isStrArray: Check = (v) => Array.isArray(v) && v.every((x) => typeof x === "string")
+const isPosInt: Check = (v) => Number.isInteger(v) && (v as number) > 0
+const isBool: Check = (v) => typeof v === "boolean"
+const oneOf = (...xs: string[]): Check => (v) => typeof v === "string" && xs.includes(v)
+const isCopyList: Check = (v) =>
+  Array.isArray(v) && v.every((x) => typeof x === "string" || (isPlainObject(x) && typeof x.to === "string" && isStrArray(x.from)))
+const isRouting: Check = (v) =>
+  Array.isArray(v) && v.every((r) => isPlainObject(r) && isPlainObject(r.when) && typeof r.category === "string")
+const isModelList: Check = (v) => v === undefined || isStrArray(v)
+
+/** Field-level schema: path -> check. A failing field is reset to its default. */
+const SCHEMA: Array<[string, Check]> = [
+  ["language.human", isStr], ["language.agent", isStr],
+  ["git.remote", isStr], ["git.baseBranch", isStrOrNull], ["git.branchPrefix", isStr], ["git.worktreeDir", isStr],
+  ["paths.tasks", isStr], ["paths.epics", isStr], ["paths.board", isStr], ["paths.template", isStr],
+  ["task.areas", isStrArray], ["task.sizes", isStrArray], ["task.idPadding", (v) => isPosInt(v) && (v as number) <= 9],
+  ["setup.copy", isCopyList], ["setup.commands", isStrArray],
+  ["verify.full", isStrOrNull], ["verify.quick", isStrOrNull], ["verify.e2e", isStrOrNull],
+  ["ci.checks", isStrArray], ["protected", isStrArray], ["qaPaths", isStrArray],
+  ["board.header", isStrArray], ["board.epicLine", isStr], ["board.epicLink", isStr], ["board.taskLine", isStr],
+  ["review.maxRounds", isPosInt], ["review.autoMerge", isBool], ["review.mergeMethod", oneOf("squash", "merge", "rebase")],
+  ["parallel", isPosInt], ["dispatch.timeoutMinutes", isPosInt], ["routing", isRouting], ["commandPrefix", isStr],
+]
+
+const getPath = (o: any, p: string) => p.split(".").reduce((a, k) => (a == null ? undefined : a[k]), o)
+function setPath(o: any, p: string, v: unknown) {
+  const keys = p.split(".")
+  let cur = o
+  for (const k of keys.slice(0, -1)) cur = cur[k] = isPlainObject(cur[k]) ? { ...cur[k] } : {}
+  cur[keys[keys.length - 1]!] = v
+}
+
+/** Mutates `config` in place: invalid fields get their defaults. Returns the problems found. */
+export function validate(config: TaskflowConfig, defaults: TaskflowConfig): string[] {
+  const problems: string[] = []
+  for (const [p, ok] of SCHEMA) {
+    if (!ok(getPath(config, p))) {
+      problems.push(`${p}: invalid value ${JSON.stringify(getPath(config, p))}, using the default`)
+      setPath(config, p, getPath(defaults, p))
+    }
+  }
+  if (!isPlainObject(config.spec) && config.spec !== null) {
+    problems.push("spec: must be an object or null")
+    config.spec = null
+  } else if (config.spec) {
+    for (const k of ["dir", "definition", "questionPattern", "acceptancePattern"] as const) {
+      if (typeof config.spec[k] !== "string") {
+        problems.push(`spec.${k}: must be a string; spec checks disabled`)
+        config.spec = null
+        break
+      }
+    }
+    if (config.spec) {
+      try {
+        new RegExp(config.spec.definition)
+        new RegExp(config.spec.questionPattern)
+        new RegExp(config.spec.acceptancePattern)
+      } catch (e) {
+        problems.push(`spec: invalid regular expression (${(e as Error).message}); spec checks disabled`)
+        config.spec = null
+      }
+    }
+  }
+  if (!isPlainObject(config.agents)) {
+    problems.push("agents: must be an object")
+    config.agents = defaults.agents
+  }
+  for (const role of ROLES) {
+    const a = config.agents[role]
+    if (a === undefined) continue
+    if (!isPlainObject(a) || !isModelList(a.models) || (a.model !== undefined && !isStr(a.model)) || (a.name !== undefined && !isStr(a.name))) {
+      problems.push(`agents.${role}: invalid, using the default`)
+      config.agents[role] = defaults.agents[role]
+    } else if (a.permissions !== undefined && !(Array.isArray(a.permissions) && a.permissions.every((r) => isPlainObject(r) && isStr(r.action) && isStr(r.resource) && oneOf("allow", "deny", "ask")(r.effect)))) {
+      problems.push(`agents.${role}.permissions: invalid, ignored`)
+      delete (a as AgentConfig).permissions
+    }
+  }
+  if (!isPlainObject(config.categories)) {
+    problems.push("categories: must be an object")
+    config.categories = defaults.categories
+  }
+  for (const [name, c] of Object.entries(config.categories)) {
+    if (!isPlainObject(c) || !isStrArray(c.models)) {
+      problems.push(`categories.${name}: needs a models list; dropped`)
+      delete config.categories[name]
+    }
+  }
+  return problems
+}
+
+/** Task id pattern for the configured padding (`T-` + at least `idPadding` digits). */
+export const taskIdRe = (cfg: TaskflowConfig) => new RegExp(`^T-\\d{${cfg.task.idPadding},}$`)
+
+/** mtime fingerprint of the config files, to re-read them only when they change. */
+export function configStamp(root: string, globalPath = globalConfigPath()): string {
+  return [globalPath, projectConfigPath(root)]
+    .map((f) => {
+      try {
+        return String(fs.statSync(f).mtimeMs)
+      } catch {
+        return "-"
+      }
+    })
+    .join("|")
 }
 
 export function agentName(config: TaskflowConfig, role: Role): string {
@@ -240,5 +375,6 @@ export function agentName(config: TaskflowConfig, role: Role): string {
 export function agentChain(config: TaskflowConfig, role: Role): string[] {
   const a = config.agents[role]
   if (!a) return []
-  return a.models ?? (a.model ? [a.model] : [])
+  // `model` is the explicit shorthand: when a layer sets it, it beats the (possibly inherited default) chain.
+  return a.model ? [a.model] : (a.models ?? [])
 }

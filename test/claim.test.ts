@@ -6,23 +6,23 @@ import { parseFrontmatter } from "../src/core/frontmatter.ts"
 import { cfg, epicFile, repoWithOrigin, sh, taskFile, TEMPLATE } from "./helpers.ts"
 
 describe("ids", () => {
-  test("nextTaskId takes max + 1 with padding", () => {
+  test("nextTaskId takes max + 1 with padding", async () => {
     expect(nextTaskId(["T-001", "T-019", "T-007"])).toBe("T-020")
     expect(nextTaskId([])).toBe("T-001")
     expect(nextTaskId(["T-999"], 3)).toBe("T-1000")
   })
-  test("slugify keeps latin words and cuts at a word boundary", () => {
+  test("slugify keeps latin words and cuts at a word boundary", async () => {
     expect(slugify("Fix: the API (v2) error!")).toBe("fix-the-api-v2-error")
     expect(slugify("one two three four five six seven eight nine ten")).toBe("one-two-three-four-five-six-seven-eight")
     expect(slugify("Только кириллица")).toBe("")
   })
-  test("renderNewTask fills the template and rejects unsafe titles", () => {
+  test("renderNewTask fills the template and rejects unsafe titles", async () => {
     const t = renderNewTask(TEMPLATE, { id: "T-042", title: "Add thing", epic: "E-03", area: "web", size: "M" })
     expect(parseFrontmatter(t).data).toMatchObject({ id: "T-042", title: "Add thing", epic: "E-03", area: "web", size: "M", status: "todo" })
     expect(t).toContain("# T-042. Add thing")
     expect(() => renderNewTask(TEMPLATE, { id: "T-1", title: 'a "b"', epic: "E-01", area: "api", size: "S" })).toThrow()
   })
-  test("collectTaskIds sees files on refs and ids in branch names", () => {
+  test("collectTaskIds sees files on refs and ids in branch names", async () => {
     const out: Record<string, string> = {
       "for-each-ref --format=%(refname) refs/remotes/origin": "refs/remotes/origin/main\nrefs/remotes/origin/task/T-030-x",
       "for-each-ref --format=%(refname) refs/heads": "refs/heads/main",
@@ -41,20 +41,20 @@ describe("ids", () => {
 
 describe("clean decisions", () => {
   const pr = { state: "MERGED", url: "u", headRefOid: "abc" }
-  test("refuses an unmerged PR", () => {
+  test("refuses an unmerged PR", async () => {
     expect(decideClean({ pr: { ...pr, state: "OPEN" }, branch: "b", localHead: "abc", inBase: true })).toMatchObject({ ok: false })
   })
-  test("allows when head matches, or contained in base or PR head", () => {
+  test("allows when head matches, or contained in base or PR head", async () => {
     expect(decideClean({ pr, branch: "b", localHead: "abc", inBase: false }).ok).toBe(true)
     expect(decideClean({ pr, branch: "b", localHead: "zzz", inBase: true }).ok).toBe(true)
     expect(decideClean({ pr, branch: "b", localHead: "zzz", inBase: false, inPrHead: true }).ok).toBe(true)
   })
-  test("lists unpushed commits otherwise", () => {
+  test("lists unpushed commits otherwise", async () => {
     const r = decideClean({ pr, branch: "b", localHead: "zzz", inBase: false, unpushed: ["123 wip"] })
     expect(r.ok).toBe(false)
     expect((r as any).reason).toContain("123 wip")
   })
-  test("resolveBranch prefers the branch field without fallback", () => {
+  test("resolveBranch prefers the branch field without fallback", async () => {
     expect(resolveBranch({ id: "T-001", branchField: "task/T-009-old", localBranches: ["task/T-009-old"], prefix: "task/" })).toEqual({ branch: "task/T-009-old" })
     expect("error" in resolveBranch({ id: "T-001", branchField: "task/T-009-old", localBranches: ["task/T-001-a"], prefix: "task/" })).toBe(true)
     expect(resolveBranch({ id: "T-001", branchField: null, localBranches: ["main", "task/T-001-a"], prefix: "task/" })).toEqual({ branch: "task/T-001-a" })
@@ -71,10 +71,10 @@ describe("claim and clean against a real git repo", () => {
     ".env.local": "SECRET=1",
   }
 
-  test("claims a ready task: worktree, branch, copied env, in_progress commit", () => {
+  test("claims a ready task: worktree, branch, copied env, in_progress commit", async () => {
     const { main, dir } = repoWithOrigin(files)
     const c = cfg({ setup: { copy: [{ to: "conf/.env", from: [".env.missing", ".env.local"] }], commands: ["echo setup-ran > setup.txt"] } })
-    const r = claim({ cwd: main, cfg: c, id: "T-001" })
+    const r = await claim({ cwd: main, cfg: c, id: "T-001" })
     expect(r.error).toBeUndefined()
     expect(r.ok).toBe(true)
     expect(r.branch).toBe("task/T-001-first-task")
@@ -86,56 +86,56 @@ describe("claim and clean against a real git repo", () => {
     expect(sh("git", ["log", "-1", "--format=%s"], wt)).toBe("chore(tasks): start T-001 [T-001]")
     expect(fs.readFileSync(path.join(wt, "tasks/README.md"), "utf8")).toContain("**in_progress**")
     // a second claim of the same task is refused
-    expect(claim({ cwd: main, cfg: c, id: "T-001" }).error).toContain("already exists")
+    expect((await claim({ cwd: main, cfg: c, id: "T-001" })).error).toContain("already exists")
   })
 
-  test("refuses unready tasks and rolls back a failed setup", () => {
+  test("refuses unready tasks and rolls back a failed setup", async () => {
     const { main, dir } = repoWithOrigin(files)
-    expect(claim({ cwd: main, cfg: cfg(), id: "T-002" }).error).toBe("T-002 depends on unfinished task(s): T-001")
-    expect(claim({ cwd: main, cfg: cfg(), id: "T-404" }).error).toContain("not found on origin/main")
-    const r = claim({ cwd: main, cfg: cfg({ setup: { commands: ["exit 3"] } }), id: "T-001" })
+    expect((await claim({ cwd: main, cfg: cfg(), id: "T-002" })).error).toBe("T-002 depends on unfinished task(s): T-001")
+    expect((await claim({ cwd: main, cfg: cfg(), id: "T-404" })).error).toContain("not found on origin/main")
+    const r = await claim({ cwd: main, cfg: cfg({ setup: { commands: ["exit 3"] } }), id: "T-001" })
     expect(r.ok).toBe(false)
     expect(r.error).toContain("exit 3")
     expect(fs.existsSync(path.join(dir, "app-wt", "t-001-first-task"))).toBe(false)
     expect(sh("git", ["branch", "--list", "task/T-001-first-task"], main)).toBe("")
   })
 
-  test("creates and claims a new task with the next free id", () => {
+  test("creates and claims a new task with the next free id", async () => {
     const { main } = repoWithOrigin(files)
-    const r = claim({ cwd: main, cfg: cfg(), create: { title: "Follow up fix", epic: "E-01", area: "api", size: "S" } })
+    const r = await claim({ cwd: main, cfg: cfg(), create: { title: "Follow up fix", epic: "E-01", area: "api", size: "S" } })
     expect(r.error).toBeUndefined()
     expect(r.id).toBe("T-003")
     const f = path.join(r.worktree!, "tasks/T-003-follow-up-fix.md")
     expect(parseFrontmatter(fs.readFileSync(f, "utf8")).data).toMatchObject({ id: "T-003", status: "in_progress", title: "Follow up fix" })
     expect(sh("git", ["log", "-1", "--format=%s"], r.worktree!)).toBe("chore(tasks): add and start T-003 [T-003]")
-    expect(claim({ cwd: main, cfg: cfg(), create: { title: "X", epic: "E-77", area: "api", size: "S" } }).error).toContain("epic E-77 not found")
+    expect((await claim({ cwd: main, cfg: cfg(), create: { title: "X", epic: "E-77", area: "api", size: "S" } })).error).toContain("epic E-77 not found")
   })
 
-  test("clean removes worktree and branch only after the PR is merged", () => {
+  test("clean removes worktree and branch only after the PR is merged", async () => {
     const { main } = repoWithOrigin(files)
     const c = cfg()
-    const r = claim({ cwd: main, cfg: c, id: "T-001" })
+    const r = await claim({ cwd: main, cfg: c, id: "T-001" })
     const head = sh("git", ["rev-parse", "HEAD"], r.worktree!)
     sh("git", ["push", "-q", "origin", r.branch!], r.worktree!)
-    const open = clean({ cwd: main, cfg: c, id: "T-001", prView: () => ({ state: "OPEN", url: "u", headRefOid: head }) })
+    const open = await clean({ cwd: main, cfg: c, id: "T-001", prView: async () => ({ state: "OPEN", url: "u", headRefOid: head }) })
     expect(open.error).toContain("not MERGED")
     expect(fs.existsSync(r.worktree!)).toBe(true)
-    const done = clean({ cwd: main, cfg: c, id: "T-001", remoteBranch: true, prView: () => ({ state: "MERGED", url: "u", headRefOid: head }) })
+    const done = await clean({ cwd: main, cfg: c, id: "T-001", remoteBranch: true, prView: async () => ({ state: "MERGED", url: "u", headRefOid: head }) })
     expect(done.error).toBeUndefined()
     expect(fs.existsSync(r.worktree!)).toBe(false)
     expect(sh("git", ["branch", "--list", r.branch!], main)).toBe("")
     expect(sh("git", ["ls-remote", "--heads", "origin", r.branch!], main)).toBe("")
   })
 
-  test("clean refuses to lose unpushed local commits", () => {
+  test("clean refuses to lose unpushed local commits", async () => {
     const { main } = repoWithOrigin(files)
     const c = cfg()
-    const r = claim({ cwd: main, cfg: c, id: "T-001" })
+    const r = await claim({ cwd: main, cfg: c, id: "T-001" })
     const pushed = sh("git", ["rev-parse", "HEAD"], r.worktree!)
     fs.writeFileSync(path.join(r.worktree!, "x.txt"), "x")
     sh("git", ["add", "-A"], r.worktree!)
     sh("git", ["commit", "-qm", "local only"], r.worktree!)
-    const res = clean({ cwd: main, cfg: c, id: "T-001", prView: () => ({ state: "MERGED", url: "u", headRefOid: pushed }) })
+    const res = await clean({ cwd: main, cfg: c, id: "T-001", prView: async () => ({ state: "MERGED", url: "u", headRefOid: pushed }) })
     expect(res.ok).toBe(false)
     expect(res.error).toContain("local only")
   })

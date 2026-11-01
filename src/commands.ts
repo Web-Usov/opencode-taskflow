@@ -1,17 +1,24 @@
-import type { TaskflowConfig } from "./config.ts"
+import type { Role, TaskflowConfig } from "./config.ts"
 import { agentName } from "./config.ts"
+import type { RepoLayout } from "./core/guard.ts"
 import { langName } from "./roles.ts"
 
 export interface CommandSpec {
   name: string
   description: string
-  /** Switch the session to this role's agent before prompting (only for the orchestrator). */
-  switchTo?: "lead"
-  render: (args: string) => string
+  /** Switch the session to this role's agent before prompting. */
+  switchTo?: Role
+  /**
+   * Claim the task named by the argument in code before prompting; on success the session moves into the worktree and
+   * switches to the implementer. `render` receives the claim report.
+   */
+  claimArg?: boolean
+  render: (args: string, claimReport?: string) => string
 }
 
 /** Slash commands: thin prompts that drive the deterministic `tf_*` tools and the role agents. */
-export function commandSpecs(cfg: TaskflowConfig): CommandSpec[] {
+export function commandSpecs(cfg: TaskflowConfig, layout: RepoLayout): CommandSpec[] {
+  const base = layout.base
   const p = cfg.commandPrefix
   const human = langName(cfg.language.human)
   const v = cfg.verify
@@ -20,18 +27,20 @@ export function commandSpecs(cfg: TaskflowConfig): CommandSpec[] {
   return [
     {
       name: `${p}next`,
-      description: "Show ready tasks and recommend one, or claim task T-xxx (worktree, branch, in_progress)",
-      render: (a) =>
+      description: "Show ready tasks and recommend one, or claim task T-xxx (worktree, branch, in_progress) and start implementing",
+      claimArg: true,
+      render: (a, report) =>
         a.trim()
-          ? `Claim task ${a.trim()}: call \`tf_start\` with id "${a.trim()}". If it fails, report the reason (blocked, unfinished depends, not todo) and stop. Otherwise call \`tf_task\` and print: the full task file, the spec rule IDs it cites, and the absolute worktree path where all further work must happen.`
+          ? `${report ?? ""}\n\nIf the claim above FAILED, explain the reason to the human (blocked, unfinished depends, not todo, fetch error) and stop. Otherwise this session now runs in the task's worktree as the implementer: call \`tf_task\` with id "${a.trim()}", print the spec rule IDs it cites and a short plan, then implement the task following your procedure (tests first, verify, then /${p}ship).`
           : `Call \`tf_next\`. List the ready tasks one line each (id, title, area, size, spec rules). Check work already in flight (\`gh pr list\`, \`tf_status\`) and recommend ONE task that does not touch the same module as an in-flight task, with a one-line reason. Do not start it.`,
     },
     {
       name: `${p}ship`,
       description: "Preflight, push, open the PR from the template, mark the task done; never merges",
+      switchTo: "implementer",
       render: (a) => `Ship the current task branch. ${a.trim() ? `Notes: ${a.trim()}\n` : ""}Stop and report on the first failure.
-1. Preflight: you are in a task worktree on \`${cfg.git.branchPrefix}T-NNN-slug\` (not the base branch); \`git fetch ${cfg.git.remote}\` and merge \`${cfg.git.remote}/<base>\` if behind (never rebase + force-push; on a board conflict run \`tf_board\`). ${v.full ? `\`${v.full}\` is green` : "The project's verify gate is green"}${v.e2e ? ` (and \`${v.e2e}\` for UI work)` : ""}. Every Definition of Done item is ticked and \`## Result\` is filled.
-2. Protected paths (\`git diff ${cfg.git.remote}/<base> --name-only\` against ${cfg.protected.join(", ")}): an implementation task must have none (stop); a planner PR that has some uses the human-review template.
+1. Preflight: you are in a task worktree on \`${cfg.git.branchPrefix}T-NNN-slug\` (not the base branch); \`git fetch ${cfg.git.remote}\` and merge \`${cfg.git.remote}/${base}\` if behind (never rebase + force-push; on a board conflict run \`tf_board\`). ${v.full ? `\`${v.full}\` is green` : "The project's verify gate is green"}${v.e2e ? ` (and \`${v.e2e}\` for UI work)` : ""}. Every Definition of Done item is ticked and \`## Result\` is filled.
+2. Protected paths (\`git diff ${cfg.git.remote}/${base} --name-only\` against ${cfg.protected.join(", ")}): an implementation task must have none (stop); a planner PR that has some uses the human-review template.
 3. Commit what is left (\`type(scope): subject [T-NNN]\`, stage everything), \`git push -u ${cfg.git.remote} <branch>\`.
 4. \`gh pr create --title "type(scope): subject [T-NNN]" --body-file <file>\`: body from \`.github/pull_request_template.md\` (agent-only PR, ${langName(cfg.language.agent)}) or \`.github/PULL_REQUEST_TEMPLATE/human-review.md\` (human-merge PR, ${human}), with the exact verify commands and named tests.
 5. ONE commit marking the task done: \`tf_set\` status done with the PR url, \`tf_board\`, \`tf_check\` (must pass), commit \`docs(tasks): mark T-NNN done [T-NNN]\`, push.
@@ -47,6 +56,7 @@ If it is a task id, find its PR (\`gh pr list --state open --search "<id>"\` or 
     {
       name: `${p}handoff`,
       description: "Save work in progress: WIP commit, push and a Handoff log entry",
+      switchTo: "implementer",
       render: (a) => `Pause the current task safely so another session can continue. Notes: ${a.trim() || "(none)"}
 1. Identify the task from the branch (\`git branch --show-current\` -> \`${cfg.git.branchPrefix}T-NNN-slug\`) and its file. On the base branch: stop and tell the user.
 2. Append to \`## Handoff log\` (never rewrite earlier entries): date (\`date -I\`), Done (what works, which DoD items), Next (ordered steps), State (branch, SHA after the WIP commit, failing tests, gotchas), and a Q-proposal in ${human} if blocked (then \`tf_set\` status blocked and tell the human a decision is needed).
@@ -62,7 +72,7 @@ If it is a task id, find its PR (\`gh pr list --state open --search "<id>"\` or 
       name: `${p}plan`,
       description: "Decompose an epic (E-xx) or an idea into tasks with the planner agent",
       render: (a) => `Planning request: ${a.trim() || "(missing: ask which epic or idea)"}.
-Call \`tf_dispatch\` with role "planner" and a prompt that asks the ${planner} agent to decompose it into tasks (or draft the epic first if it does not exist), following its work modes, on its own plan/ branch and PR. Report the PR url and the task list it proposes, in ${human}.`,
+First call \`tf_start\` with \`plan\` = a short latin slug for this request (it creates or reuses the \`plan/<slug>\` worktree). Then call \`tf_dispatch\` with role "planner", \`directory\` = that worktree and a prompt that asks the ${planner} agent to decompose the request into tasks (or draft the epic first if it does not exist), following its work modes, and ship it as one PR from that branch. Report the PR url and the task list it proposes, in ${human}.`,
     },
     {
       name: `${p}drive`,
@@ -73,7 +83,7 @@ Call \`tf_dispatch\` with role "planner" and a prompt that asks the ${planner} a
     {
       name: `${p}milestone`,
       description: "Prepare the milestone acceptance report for an epic (E-xx)",
-      render: (a) => `Prepare the milestone report for epic ${a.trim() || "(missing: ask for E-xx)"} with \`tf_dispatch\` role "planner": verify all its tasks are done with merged PRs (\`tf_check\` with gh=true), run the full verify${v.e2e ? ` and e2e (\`${v.e2e}\`)` : ""} on an up-to-date base, and write \`docs/milestones/<E-xx>-report.md\` in ${human}: summary, merged PRs table, rule/AC coverage, demo scenario from the epic's acceptance criteria, risks, what the human should check. Open (not merge) a human-review PR with the report (and the epic status change to done). Never set \`accepted\`. Report where it is and how to accept, in ${human}.`,
+      render: (a) => `Prepare the milestone report for epic ${a.trim() || "(missing: ask for E-xx)"}: call \`tf_start\` with \`plan\` = "milestone-<epic id>", then \`tf_dispatch\` role "planner" with \`directory\` = that worktree: verify all its tasks are done with merged PRs (\`tf_check\` with gh=true), run the full verify${v.e2e ? ` and e2e (\`${v.e2e}\`)` : ""} on an up-to-date base, and write \`docs/milestones/<E-xx>-report.md\` in ${human}: summary, merged PRs table, rule/AC coverage, demo scenario from the epic's acceptance criteria, risks, what the human should check. Open (not merge) a human-review PR with the report (and the epic status change to done). Never set \`accepted\`. Report where it is and how to accept, in ${human}.`,
     },
     {
       name: `${p}init`,

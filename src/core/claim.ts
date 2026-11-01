@@ -1,8 +1,8 @@
 import fs from "node:fs"
 import path from "node:path"
-import type { CopySpec, TaskflowConfig } from "../config.ts"
+import { taskIdRe, type CopySpec, type TaskflowConfig } from "../config.ts"
 import { asList, asString, parseFrontmatter } from "./frontmatter.ts"
-import { detectBaseBranch, git, mainCheckout, run, runShell, tryGit } from "./git.ts"
+import { baseRefOf, detectBaseBranch, git, hasRemote, mainCheckout, NET_TIMEOUT, run, runShell, tryGit } from "./git.ts"
 import { setStatus, writeBoard } from "./tasks.ts"
 
 // ---------- ids ----------
@@ -65,18 +65,40 @@ export interface NewTask {
 /** Turns the task template into a new task file (status todo; the claim sets in_progress afterwards). */
 export function renderNewTask(template: string, t: NewTask): string {
   if (/[#\n"]/.test(t.title)) throw new Error("title must not contain #, quotes or newlines")
+  // function replacements: a `$&` or `$1` in the title must stay literal
   return template
-    .replace(/^id: .*$/m, `id: ${t.id}`)
-    .replace(/^title: .*$/m, `title: "${t.title}"`)
-    .replace(/^epic: [^\s#]*/m, `epic: ${t.epic}`)
-    .replace(/^area: [^\s#]*/m, `area: ${t.area}`)
-    .replace(/^size: [^\s#]*/m, `size: ${t.size}`)
-    .replace(/^# T-0+\. .*$/m, `# ${t.id}. ${t.title}`)
+    .replace(/^id: .*$/m, () => `id: ${t.id}`)
+    .replace(/^title: .*$/m, () => `title: "${t.title}"`)
+    .replace(/^epic: [^\s#]*/m, () => `epic: ${t.epic}`)
+    .replace(/^area: [^\s#]*/m, () => `area: ${t.area}`)
+    .replace(/^size: [^\s#]*/m, () => `size: ${t.size}`)
+    .replace(/^# T-0+\. .*$/m, () => `# ${t.id}. ${t.title}`)
+}
+
+/** Absolute parent directory of all task worktrees (`git.worktreeDir` with `{repo}` rendered). */
+export function worktreeParent(mainDir: string, cfg: TaskflowConfig): string {
+  return path.resolve(mainDir, cfg.git.worktreeDir.replaceAll("{repo}", path.basename(mainDir)))
 }
 
 export function worktreePath(mainDir: string, cfg: TaskflowConfig, id: string, slug: string): string {
-  const dir = cfg.git.worktreeDir.replace("{repo}", path.basename(mainDir))
-  return path.resolve(mainDir, dir, `${id.toLowerCase()}-${slug}`)
+  return path.join(worktreeParent(mainDir, cfg), `${id.toLowerCase()}-${slug}`)
+}
+
+/** Fetch the remote unless there is none; a failed fetch is an error unless `offline`. */
+async function fetchRemote(mainDir: string, cfg: TaskflowConfig, log: string[], offline: boolean, signal?: AbortSignal): Promise<string | null> {
+  const remote = cfg.git.remote
+  if (!hasRemote(mainDir, remote)) {
+    log.push(`no remote "${remote}": using local refs`)
+    return null
+  }
+  if (offline) {
+    log.push("offline: skipped git fetch")
+    return null
+  }
+  const f = await run("git", ["fetch", remote], mainDir, { timeout: NET_TIMEOUT, signal })
+  if (!f.ok) return `git fetch ${remote} failed (${f.stderr.trim()}); fix the remote access or pass offline=true to use local refs`
+  log.push(`git fetch ${remote}`)
+  return null
 }
 
 function copySpecs(cfg: TaskflowConfig): CopySpec[] {
@@ -94,6 +116,9 @@ export interface ClaimInput {
   keep?: boolean
   /** Skip `setup.commands` (tests). */
   skipSetup?: boolean
+  /** Do not fetch; validate against the local remote-tracking refs. */
+  offline?: boolean
+  signal?: AbortSignal
 }
 
 export interface ClaimResult {
@@ -111,7 +136,7 @@ export interface ClaimResult {
  * With `create`, first writes a new task file from the template with the next free id.
  * On failure after the worktree exists, it is removed again unless `keep`.
  */
-export function claim(input: ClaimInput): ClaimResult {
+export async function claim(input: ClaimInput): Promise<ClaimResult> {
   const { cfg } = input
   const log: string[] = []
   const fail = (error: string): ClaimResult => ({ ok: false, log, error })
@@ -123,13 +148,12 @@ export function claim(input: ClaimInput): ClaimResult {
     return fail(`${input.cwd} is not inside a git repository`)
   }
   const remote = cfg.git.remote
-  if (tryGit(["remote", "get-url", remote], mainDir) !== null) {
-    const f = run("git", ["fetch", remote], mainDir)
-    log.push(f.ok ? `git fetch ${remote}` : `warning: git fetch ${remote} failed: ${f.stderr.trim()}`)
-  }
+  const fetchError = await fetchRemote(mainDir, cfg, log, !!input.offline, input.signal)
+  if (fetchError) return fail(fetchError)
   const base = detectBaseBranch(mainDir, remote, cfg.git.baseBranch)
-  const baseRef = tryGit(["rev-parse", "--verify", "--quiet", `refs/remotes/${remote}/${base}`], mainDir) ? `${remote}/${base}` : base
+  const baseRef = baseRefOf(mainDir, remote, base)
   log.push(`base: ${baseRef}`)
+  const idRe = taskIdRe(cfg)
 
   const files = (tryGit(["ls-tree", "--name-only", baseRef, `${cfg.paths.tasks}/`], mainDir) ?? "").split("\n")
   const tasks = files
@@ -162,7 +186,7 @@ export function claim(input: ClaimInput): ClaimResult {
       return fail((e as Error).message)
     }
   } else {
-    if (!input.id || !/^T-\d{3,}$/.test(input.id)) return fail(`invalid task id "${input.id ?? ""}"`)
+    if (!input.id || !idRe.test(input.id)) return fail(`invalid task id "${input.id ?? ""}"`)
     id = input.id
     const task = tasks.find((t) => asString(t.data!.id) === id)
     if (!task) return fail(`${id} not found on ${baseRef} (is the task file merged? Create it with \`create\`)`)
@@ -182,7 +206,7 @@ export function claim(input: ClaimInput): ClaimResult {
   }
 
   fs.mkdirSync(path.dirname(wtPath), { recursive: true })
-  const add = run("git", ["worktree", "add", wtPath, "-b", branch, baseRef], mainDir)
+  const add = await run("git", ["worktree", "add", wtPath, "-b", branch, baseRef], mainDir, { timeout: NET_TIMEOUT })
   if (!add.ok) return fail(`git worktree add failed: ${add.stderr.trim()}`)
   log.push(`worktree ${wtPath} on ${branch}`)
 
@@ -197,7 +221,7 @@ export function claim(input: ClaimInput): ClaimResult {
     }
     if (!input.skipSetup) {
       for (const cmd of cfg.setup.commands) {
-        const r = runShell(cmd, wtPath)
+        const r = await runShell(cmd, wtPath, { signal: input.signal }) // no timeout: installs may take minutes
         if (!r.ok) throw new Error(`\`${cmd}\` failed (exit ${r.code}): ${(r.stderr || r.stdout).trim().slice(-2000)}`)
         log.push(`ran ${cmd}`)
       }
@@ -209,10 +233,10 @@ export function claim(input: ClaimInput): ClaimResult {
     }
     setStatus(wtPath, cfg, id, "in_progress", { branch })
     writeBoard(wtPath, cfg)
-    const addTasks = run("git", ["add", cfg.paths.tasks, cfg.paths.board], wtPath)
+    const addTasks = await run("git", ["add", "--", cfg.paths.tasks, cfg.paths.board], wtPath)
     if (!addTasks.ok) throw new Error(`git add failed: ${addTasks.stderr.trim()}`)
     const subject = input.create ? `chore(tasks): add and start ${id} [${id}]` : `chore(tasks): start ${id} [${id}]`
-    const commit = run("git", ["commit", "-m", subject], wtPath)
+    const commit = await run("git", ["commit", "-m", subject], wtPath, { timeout: NET_TIMEOUT })
     if (!commit.ok) throw new Error(`claim commit failed: ${(commit.stderr || commit.stdout).trim().slice(-2000)}`)
     log.push(`committed "${subject}"`)
   } catch (e) {
@@ -220,13 +244,48 @@ export function claim(input: ClaimInput): ClaimResult {
     if (input.keep) {
       log.push(`kept worktree ${wtPath} and branch ${branch} for inspection`)
     } else {
-      const rm = run("git", ["worktree", "remove", "--force", wtPath], mainDir)
-      const del = run("git", ["branch", "-D", branch], mainDir)
+      const rm = await run("git", ["worktree", "remove", "--force", wtPath], mainDir)
+      const del = await run("git", ["branch", "-D", branch], mainDir)
       log.push(rm.ok && del.ok ? `rolled back: removed ${wtPath} and ${branch}` : `rollback incomplete: git worktree remove --force ${wtPath} && git branch -D ${branch}`)
     }
     return { ok: false, id, branch, worktree: wtPath, log, error: msg }
   }
   return { ok: true, id, branch, worktree: wtPath, log }
+}
+
+// ---------- planner worktree ----------
+
+/**
+ * Worktree for planner work (`plan/<slug>` from the base branch, no task claim): tasks, epics and spec changes are
+ * prepared there and shipped as one PR. Reuses an existing worktree of that branch.
+ */
+export async function planWorktree(input: { cwd: string; cfg: TaskflowConfig; slug: string; offline?: boolean; signal?: AbortSignal }): Promise<ClaimResult> {
+  const { cfg } = input
+  const log: string[] = []
+  const slug = slugify(input.slug)
+  if (!slug) return { ok: false, log, error: "slug must contain latin letters or digits" }
+  let mainDir: string
+  try {
+    mainDir = mainCheckout(input.cwd)
+  } catch {
+    return { ok: false, log, error: `${input.cwd} is not inside a git repository` }
+  }
+  const branch = `plan/${slug}`
+  const wtPath = path.join(worktreeParent(mainDir, cfg), `plan-${slug}`)
+  const existing = (tryGit(["worktree", "list", "--porcelain"], mainDir) ?? "").split("\n\n").find((b) => b.includes(`branch refs/heads/${branch}\n`) || b.endsWith(`branch refs/heads/${branch}`))
+  if (existing) {
+    const p = existing.match(/^worktree (.*)$/m)?.[1]
+    return { ok: true, branch, worktree: p, log: [`reusing worktree ${p} on ${branch}`] }
+  }
+  const fetchError = await fetchRemote(mainDir, cfg, log, !!input.offline, input.signal)
+  if (fetchError) return { ok: false, log, error: fetchError }
+  const baseRef = baseRefOf(mainDir, cfg.git.remote, detectBaseBranch(mainDir, cfg.git.remote, cfg.git.baseBranch))
+  const local = tryGit(["branch", "--list", branch], mainDir)
+  fs.mkdirSync(path.dirname(wtPath), { recursive: true })
+  const add = await run("git", local ? ["worktree", "add", wtPath, branch] : ["worktree", "add", wtPath, "-b", branch, baseRef], mainDir, { timeout: NET_TIMEOUT })
+  if (!add.ok) return { ok: false, log, error: `git worktree add failed: ${add.stderr.trim()}` }
+  log.push(`worktree ${wtPath} on ${branch}${local ? "" : ` from ${baseRef}`}`)
+  return { ok: true, branch, worktree: wtPath, log }
 }
 
 // ---------- clean ----------
@@ -285,11 +344,12 @@ export interface CleanInput {
   id: string
   remoteBranch?: boolean
   /** Injectable for tests; default asks `gh pr view <branch>`. */
-  prView?: (branch: string, cwd: string) => PrInfo | { error: string }
+  prView?: (branch: string, cwd: string) => Promise<PrInfo | { error: string }>
+  signal?: AbortSignal
 }
 
-export function ghPrView(branch: string, cwd: string): PrInfo | { error: string } {
-  const r = run("gh", ["pr", "view", branch, "--json", "state,url,headRefOid"], cwd)
+export async function ghPrView(branch: string, cwd: string): Promise<PrInfo | { error: string }> {
+  const r = await run("gh", ["pr", "view", branch, "--json", "state,url,headRefOid"], cwd, { timeout: NET_TIMEOUT })
   if (!r.ok) return { error: `cannot read the PR of ${branch} with gh (${r.stderr.trim()})` }
   try {
     return JSON.parse(r.stdout) as PrInfo
@@ -298,10 +358,10 @@ export function ghPrView(branch: string, cwd: string): PrInfo | { error: string 
   }
 }
 
-export function clean(input: CleanInput): { ok: boolean; log: string[]; error?: string } {
+export async function clean(input: CleanInput): Promise<{ ok: boolean; log: string[]; error?: string }> {
   const { cfg, id } = input
   const log: string[] = []
-  if (!/^T-\d{3,}$/.test(id)) return { ok: false, log, error: `invalid task id "${id}"` }
+  if (!taskIdRe(cfg).test(id)) return { ok: false, log, error: `invalid task id "${id}"` }
   let mainDir: string
   try {
     mainDir = mainCheckout(input.cwd)
@@ -309,9 +369,11 @@ export function clean(input: CleanInput): { ok: boolean; log: string[]; error?: 
     return { ok: false, log, error: `${input.cwd} is not inside a git repository` }
   }
   const remote = cfg.git.remote
-  run("git", ["fetch", remote], mainDir)
+  const remoteExists = hasRemote(mainDir, remote)
+  if (remoteExists) await run("git", ["fetch", remote], mainDir, { timeout: NET_TIMEOUT, signal: input.signal })
+  await run("git", ["worktree", "prune"], mainDir) // a worktree deleted by hand still pins its branch
   const base = detectBaseBranch(mainDir, remote, cfg.git.baseBranch)
-  const baseRef = tryGit(["rev-parse", "--verify", "--quiet", `refs/remotes/${remote}/${base}`], mainDir) ? `${remote}/${base}` : base
+  const baseRef = baseRefOf(mainDir, remote, base)
 
   let branchField: string | null = null
   const name = (tryGit(["ls-tree", "--name-only", baseRef, `${cfg.paths.tasks}/`], mainDir) ?? "")
@@ -324,12 +386,14 @@ export function clean(input: CleanInput): { ok: boolean; log: string[]; error?: 
   if ("error" in resolved) return { ok: false, log, error: resolved.error }
   const branch = resolved.branch
 
-  const pr = (input.prView ?? ghPrView)(branch, mainDir)
+  const pr = await (input.prView ?? ghPrView)(branch, mainDir)
   if ("error" in pr) return { ok: false, log, error: pr.error }
   const localHead = git(["rev-parse", branch], mainDir)
-  const ok = (args: string[]) => run("git", args, mainDir).ok
+  const ok = (args: string[]) => tryGit(args, mainDir) !== null
   const inBase = ok(["merge-base", "--is-ancestor", branch, baseRef])
-  if (pr.headRefOid && !ok(["cat-file", "-e", `${pr.headRefOid}^{commit}`])) run("git", ["fetch", remote, pr.headRefOid], mainDir)
+  if (remoteExists && pr.headRefOid && !ok(["cat-file", "-e", `${pr.headRefOid}^{commit}`])) {
+    await run("git", ["fetch", remote, pr.headRefOid], mainDir, { timeout: NET_TIMEOUT, signal: input.signal })
+  }
   const prHeadKnown = !!pr.headRefOid && ok(["cat-file", "-e", `${pr.headRefOid}^{commit}`])
   const inPrHead = prHeadKnown && ok(["merge-base", "--is-ancestor", branch, pr.headRefOid])
   const cmpBase = prHeadKnown ? pr.headRefOid : baseRef
@@ -342,18 +406,32 @@ export function clean(input: CleanInput): { ok: boolean; log: string[]; error?: 
     .map((b) => ({ p: b.match(/^worktree (.*)$/m)?.[1], br: b.match(/^branch refs\/heads\/(.*)$/m)?.[1] }))
     .find((w) => w.br === branch)?.p
   if (wt && fs.existsSync(wt)) {
-    const rm = run("git", ["worktree", "remove", wt], mainDir) // no --force: refuses a dirty worktree
+    const rm = await run("git", ["worktree", "remove", wt], mainDir) // no --force: refuses a dirty worktree
     if (!rm.ok) return { ok: false, log, error: `git worktree remove ${wt} failed (dirty?): ${rm.stderr.trim()}` }
     log.push(`removed worktree ${wt}`)
   }
-  const del = run("git", ["branch", "-D", branch], mainDir)
+  const del = await run("git", ["branch", "-D", branch], mainDir)
   if (!del.ok) return { ok: false, log, error: `git branch -D ${branch} failed: ${del.stderr.trim()}` }
   log.push(`deleted local branch ${branch}`)
-  if (input.remoteBranch) {
-    const r = run("git", ["push", remote, "--delete", branch], mainDir)
+  if (input.remoteBranch && remoteExists) {
+    const r = await run("git", ["push", remote, "--delete", branch], mainDir, { timeout: NET_TIMEOUT })
     log.push(r.ok ? `deleted ${remote}/${branch}` : `${remote}/${branch} already gone`)
   }
-  run("git", ["fetch", remote, "--prune"], mainDir)
-  log.push(`${id} cleaned; update the main checkout with git pull --ff-only`)
+  if (remoteExists) await run("git", ["fetch", remote, "--prune"], mainDir, { timeout: NET_TIMEOUT })
+  log.push(await fastForwardMain(mainDir, base, baseRef))
+  log.push(`${id} cleaned`)
   return { ok: true, log }
+}
+
+/**
+ * Brings the main checkout up to the base ref when it is safe (on the base branch, clean tree, fast-forward only), so
+ * statuses merged in PRs become visible to tf_next. Otherwise says what to do.
+ */
+export async function fastForwardMain(mainDir: string, base: string, baseRef: string): Promise<string> {
+  if (baseRef === base) return "main checkout: no remote ref to fast-forward to"
+  const current = tryGit(["branch", "--show-current"], mainDir)
+  if (current !== base) return `main checkout is on "${current}", not ${base}: update it by hand`
+  if (tryGit(["status", "--porcelain"], mainDir)) return "main checkout has local changes: update it by hand (git pull --ff-only)"
+  const r = await run("git", ["merge", "--ff-only", baseRef], mainDir, { timeout: NET_TIMEOUT })
+  return r.ok ? `main checkout fast-forwarded to ${baseRef}` : `main checkout could not fast-forward (${r.stderr.trim()}): update it by hand`
 }
