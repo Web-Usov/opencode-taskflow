@@ -81,6 +81,10 @@ scripts/e2e.sh         loads the plugin into the running OpenCode service and as
     repository after symlink resolution. Hidden/secret/ignored paths are refused; source formats are text documentation.
     An over-budget load fails with no partial context. This is path-based defence, not semantic secret detection or an
     OS sandbox against concurrent filesystem attacks.
+20. **Continuation revalidation.** Child session metadata stores its task/role/parent/directory association, not source
+    snapshots. A continuation recovers that association and reloads/revalidates the binding even when `task` is omitted.
+    Conflicting identities or unrecoverable legacy children fail closed before prompting. Session metadata round-trip
+    support was checked against OpenCode 2.2.6 without model calls.
 
 ## Borrowed from oh-my-openagent
 
