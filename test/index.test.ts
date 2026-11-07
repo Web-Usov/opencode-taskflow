@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, test } from "bun:test"
 import fs from "node:fs"
 import path from "node:path"
-import { repoWithOrigin, TEMPLATE, epicFile, taskFile } from "./helpers.ts"
+import { repoWithOrigin, TEMPLATE, epicFile, taskFile, sh, write } from "./helpers.ts"
 
 const T = 60_000
 
@@ -10,6 +10,183 @@ const CONFIG = JSON.stringify({
     implementer: { models: ["acme/disabled#low", "acme/good#low"] },
     reviewer: { models: ["acme/good#low"] },
   },
+})
+
+describe("standards dispatch integration (no live models)", () => {
+  async function boundRepo() {
+    const h = await boot({ agents: { implementer: { name: "builder" }, reviewer: { name: "auditor" } } })
+    const wt = path.join(h.dir, "bound-worktree")
+    sh("git", ["worktree", "add", "-q", "-b", "task/T-001-bound", wt], h.main)
+    const entry = { id: "chosen", title: "Chosen convention", path: "docs/rules.md", status: "approved" }
+    write(wt, "docs/standards/index.json", JSON.stringify({ version: 1, entries: [entry] }))
+    write(wt, "docs/rules.md", "# Bound source\nWORKTREE CONTENT; subordinate to AGENTS/spec/guard.")
+    const task = taskFile({ id: "T-001", title: "First task" }).replace("spec: []", "spec: []\nstandards: [chosen]")
+    write(wt, "tasks/T-001-first-task.md", task)
+    // Main deliberately has a stale, invalid binding: reviewer must not use it.
+    write(h.main, "tasks/T-001-first-task.md", task.replace("[chosen]", "[stale-main]"))
+    return { ...h, wt, task, entry, tool: h.tools.find((t) => t.name === "tf_dispatch"), context: { sessionID: "ses_parent", agent: "lead", signal: new AbortController().signal } }
+  }
+
+  test("implementer and reviewer receive exact same ids, refs, contents and hashes from task worktree", async () => {
+    const h = await boundRepo()
+    try {
+      const results = []
+      for (const role of ["implementer", "reviewer"]) results.push(await h.tool.execute({ role, task: "T-001", prompt: "Do assigned work" }, h.context))
+      const prompts = h.calls.filter((c) => c.fn === "session.prompt").map((c) => c.arg.text)
+      expect(prompts).toHaveLength(2)
+      const bindings = prompts.map((p: string) => p.slice(p.indexOf("Standards binding source:")))
+      expect(bindings[0]).toBe(bindings[1])
+      expect(bindings[0]).toContain(h.wt)
+      expect(bindings[0]).toContain("chosen")
+      expect(bindings[0]).toContain("docs/rules.md")
+      expect(bindings[0]).toContain("WORKTREE CONTENT")
+      expect(bindings[0]).not.toContain("stale-main")
+      expect(bindings[0]).toContain("not instructions to bypass permissions")
+      const creates = h.calls.filter((c) => c.fn === "session.create")
+      expect(creates[0]!.arg.location.directory).toBe(h.wt)
+      expect(creates[1]!.arg.location.directory).toBe(h.main)
+      for (const r of results) {
+        expect(r.content).toContain("chosen -> docs/rules.md (sha256")
+        expect(r.content).toContain("VERDICT: LGTM")
+      }
+    } finally { h.cleanup() }
+  })
+
+  test("missing/draft/invalid/oversized bindings fail before child creation or prompt, atomically", async () => {
+    const h = await boundRepo()
+    try {
+      const variants = [
+        { binding: "[unknown]" },
+        { binding: "chosen" },
+        { binding: "[chosen, chosen]" },
+        { binding: "[chosen]", status: "draft" },
+        { binding: "[chosen]", missingIndex: true },
+        { binding: "[chosen]", badIndex: true },
+        { binding: "[chosen]", missingSource: true },
+        { binding: "[chosen]", source: "x".repeat(25_000) },
+        { binding: "[chosen]", sourcePath: "../outside.md" },
+        { binding: "[chosen, missing]", second: true },
+      ]
+      for (const v of variants) {
+        write(h.wt, "tasks/T-001-first-task.md", h.task.replace("standards: [chosen]", `standards: ${v.binding}`))
+        write(h.wt, "docs/rules.md", v.source ?? "GOOD DATA MUST NOT PARTIALLY INJECT")
+        const entries = [{ ...h.entry, status: v.status ?? "approved", path: v.sourcePath ?? h.entry.path }, ...(v.second ? [{ ...h.entry, id: "missing", path: "docs/missing.md" }] : [])]
+        write(h.wt, "docs/standards/index.json", v.badIndex ? "{broken" : JSON.stringify({ version: 1, entries }))
+        if (v.missingIndex) fs.unlinkSync(path.join(h.wt, "docs/standards/index.json"))
+        if (v.missingSource) fs.unlinkSync(path.join(h.wt, "docs/rules.md"))
+        const before = h.calls.length
+        for (const role of ["implementer", "reviewer"]) {
+          const r = await h.tool.execute({ role, task: "T-001", prompt: "work" }, h.context)
+          expect(r.content).toContain("ERROR: dispatch failed")
+          expect(r.content).not.toContain("GOOD DATA")
+        }
+        expect(h.calls.slice(before).some((c) => ["session.create", "session.prompt"].includes(c.fn))).toBe(false)
+      }
+      const before = h.calls.length
+      expect((await h.tool.execute({ role: "reviewer", task: "T-404", prompt: "work" }, h.context)).content).toContain("not found")
+      expect(h.calls.slice(before).some((c) => c.fn === "session.create")).toBe(false)
+    } finally { h.cleanup() }
+  })
+
+  test("continuations retain task and configured role identity; repeated or omitted task revalidates before prompt", async () => {
+    const h = await boundRepo()
+    try {
+      const created = await h.tool.execute({ role: "implementer", task: "T-001", prompt: "work" }, h.context)
+      const sessionID = created.content.match(/child session: (\S+)/)![1]
+      expect(h.sessions.get(sessionID).agent).toBe("builder")
+      expect(h.sessions.get(sessionID).metadata.taskflowDispatch.task).toBe("T-001")
+      for (const task of [undefined, "T-001"]) {
+        const result = await h.tool.execute({ role: "implementer", sessionID, task, prompt: "continue" }, h.context)
+        expect(result.content).toContain("chosen -> docs/rules.md")
+        const prompt = h.calls.filter((c) => c.fn === "session.prompt").at(-1)!.arg.text
+        expect(prompt).toContain("Task: T-001")
+        expect(prompt).not.toContain("Standards: none explicitly selected")
+      }
+      const before = h.calls.filter((c) => c.fn === "session.prompt").length
+      for (const request of [
+        { role: "implementer", task: "T-002" },
+        { role: "reviewer" },
+        { role: "implementer", directory: h.main },
+      ]) {
+        expect((await h.tool.execute({ ...request, sessionID, prompt: "wrong association" }, h.context)).content).toContain("ERROR")
+      }
+      expect((await h.tool.execute({ role: "implementer", sessionID, prompt: "wrong parent" }, { ...h.context, sessionID: "other_parent" })).content).toContain("different parent")
+      const child = h.sessions.get(sessionID)
+      child.agent = "auditor"
+      expect((await h.tool.execute({ role: "implementer", sessionID, prompt: "wrong actual agent" }, h.context)).content).toContain("identity/agent/parent")
+      child.agent = "builder"
+      const metadata = child.metadata
+      child.metadata = { taskflowDispatch: { ...metadata.taskflowDispatch, task: "T-002" } }
+      expect((await h.tool.execute({ role: "implementer", sessionID, prompt: "tampered metadata" }, h.context)).content).toContain("association changed")
+      // Runtime association also protects a host that omits session metadata on get.
+      delete child.metadata
+      // A stale id or a draft is rejected even when task is omitted, including after an earlier valid continuation.
+      for (const entries of [[], [{ ...h.entry, status: "draft" }]]) {
+        write(h.wt, "docs/standards/index.json", JSON.stringify({ version: 1, entries }))
+        for (const task of [undefined, "T-001"]) {
+          expect((await h.tool.execute({ role: "implementer", sessionID, task, prompt: "invalid binding" }, h.context)).content).toContain("ERROR: dispatch failed")
+        }
+      }
+      child.metadata = metadata
+      expect(h.calls.filter((c) => c.fn === "session.prompt")).toHaveLength(before)
+      expect(h.calls.filter((c) => c.fn === "session.create")).toHaveLength(1)
+    } finally { h.cleanup() }
+  })
+
+  test("session metadata recovers original binding after plugin reload, and fails closed when unavailable", async () => {
+    const h = await boundRepo()
+    let cleanup: any
+    try {
+      const created = await h.tool.execute({ role: "implementer", task: "T-001", prompt: "work" }, h.context)
+      const sessionID = created.content.match(/child session: (\S+)/)![1]
+      h.cleanup()
+      const reloaded = fakeCtx(h.main, h.sessions)
+      cleanup = await (await import("../src/index.ts")).default.setup(reloaded.ctx)
+      reloaded.replay()
+      const tool = reloaded.tools.find((t) => t.name === "tf_dispatch")
+      expect((await tool.execute({ role: "implementer", sessionID, prompt: "recover task" }, h.context)).content).toContain("chosen -> docs/rules.md")
+      expect(reloaded.calls.filter((c) => c.fn === "session.prompt").at(-1)!.arg.text).toContain("Task: T-001")
+      const before = reloaded.calls.filter((c) => c.fn === "session.prompt").length
+      expect((await tool.execute({ role: "implementer", sessionID, task: "T-002", prompt: "contradiction" }, h.context)).content).toContain("contradictory task identity")
+      expect((await tool.execute({ role: "reviewer", sessionID, prompt: "wrong role" }, h.context)).content).toContain("role/agent")
+      write(h.wt, "docs/standards/index.json", JSON.stringify({ version: 1, entries: [{ ...h.entry, status: "draft" }] }))
+      expect((await tool.execute({ role: "implementer", sessionID, prompt: "draft after reload" }, h.context)).content).toContain("is draft")
+      expect(reloaded.calls.filter((c) => c.fn === "session.prompt")).toHaveLength(before)
+
+      // Unknown legacy sessions cannot be rebound by supplying a task or by omitting one.
+      h.sessions.set("ses_legacy", { id: "ses_legacy", parentID: "ses_parent", agent: "builder", location: { directory: h.wt } })
+      for (const task of [undefined, "T-001"]) {
+        expect((await tool.execute({ role: "implementer", sessionID: "ses_legacy", task, prompt: "legacy" }, h.context)).content).toContain("cannot recover child task/role association")
+      }
+      // A fresh setup cannot trust the old in-memory association once durable metadata is gone.
+      cleanup()
+      delete h.sessions.get(sessionID).metadata
+      const unavailable = fakeCtx(h.main, h.sessions)
+      cleanup = await (await import("../src/index.ts")).default.setup(unavailable.ctx)
+      unavailable.replay()
+      for (const task of [undefined, "T-001"]) {
+        expect((await unavailable.tools.find((t) => t.name === "tf_dispatch").execute({ role: "implementer", sessionID, task, prompt: "no metadata" }, h.context)).content).toContain("cannot recover child task/role association")
+      }
+      expect(unavailable.calls.some((c) => c.fn === "session.prompt")).toBe(false)
+    } finally { h.cleanup(); cleanup?.() }
+  })
+
+  test("a reviewer child id cannot run as implementer; taskless children cannot silently acquire a task", async () => {
+    const h = await boundRepo()
+    try {
+      const created = await h.tool.execute({ role: "reviewer", task: "T-001", prompt: "review" }, h.context)
+      const sessionID = created.content.match(/child session: (\S+)/)![1]
+      expect(h.sessions.get(sessionID).agent).toBe("auditor")
+      const before = h.calls.filter((c) => c.fn === "session.prompt").length
+      expect((await h.tool.execute({ role: "implementer", sessionID, prompt: "wrong session id" }, h.context)).content).toContain("role/agent")
+      expect(h.calls.filter((c) => c.fn === "session.prompt")).toHaveLength(before)
+      const taskless = await h.tool.execute({ role: "planner", prompt: "plan" }, h.context)
+      const plannerID = taskless.content.match(/child session: (\S+)/)![1]
+      const count = h.calls.filter((c) => c.fn === "session.prompt").length
+      expect((await h.tool.execute({ role: "planner", sessionID: plannerID, task: "T-001", prompt: "bind silently" }, h.context)).content).toContain("contradictory task identity")
+      expect(h.calls.filter((c) => c.fn === "session.prompt")).toHaveLength(count)
+    } finally { h.cleanup() }
+  })
 })
 
 function makeRepo() {
@@ -23,7 +200,7 @@ function makeRepo() {
 }
 
 /** A fake OpenCode plugin context that records transforms, hooks and session calls. */
-function fakeCtx(directory: string) {
+function fakeCtx(directory: string, sessions = new Map<string, any>()) {
   const agents = new Map<string, any>()
   const commands: any[] = []
   const tools: any[] = []
@@ -50,14 +227,19 @@ function fakeCtx(directory: string) {
       }),
     },
     session: {
-      create: spy("session.create", () => ({ id: "ses_child" })),
+      create: spy("session.create", (arg) => {
+        const id = `ses_child_${sessions.size + 1}`
+        const session = { ...arg, id }
+        sessions.set(id, session)
+        return session
+      }),
       prompt: spy("session.prompt"),
       wait: spy("session.wait"),
       context: spy("session.context", () => [
         { type: "assistant", content: [{ type: "text", text: "VERDICT: LGTM" }] },
         { type: "idle", outcome: "succeeded" },
       ]),
-      get: spy("session.get", () => ({ location: { directory } })),
+      get: spy("session.get", (arg) => sessions.get(arg.sessionID) ?? { id: arg.sessionID, location: { directory } }),
       move: spy("session.move"),
       switchAgent: spy("session.switchAgent"),
       interrupt: spy("session.interrupt"),
@@ -80,11 +262,12 @@ function fakeCtx(directory: string) {
     transforms.command.forEach((cb) => cb(commandEditor))
     transforms.tool.forEach((cb) => cb(toolEditor))
   }
-  return { ctx, agents, commands, tools, hooks, calls, replay }
+  return { ctx, agents, commands, tools, hooks, calls, replay, sessions }
 }
 
-async function boot() {
+async function boot(overrides: Record<string, unknown> = {}) {
   const repo = makeRepo()
+  if (Object.keys(overrides).length) write(repo.main, ".opencode/taskflow.jsonc", JSON.stringify({ ...JSON.parse(CONFIG), ...overrides }))
   const f = fakeCtx(repo.main)
   const plugin = (await import("../src/index.ts")).default
   const cleanup: any = await plugin.setup(f.ctx)
@@ -118,10 +301,10 @@ describe("plugin entry with a fake OpenCode context", () => {
     expect(has("reviewer", "taskflow.write", "*")).toBe(true)
   })
 
-  test("10 prefixed commands and 11 tools with permission and codemode:false", () => {
-    expect(h.commands).toHaveLength(10)
+  test("13 prefixed commands and 12 tools with permission and codemode:false", () => {
+    expect(h.commands).toHaveLength(13)
     for (const c of h.commands) expect(c.name.startsWith("tf-")).toBe(true)
-    expect(h.tools).toHaveLength(11)
+    expect(h.tools).toHaveLength(12)
     for (const t of h.tools) {
       expect(["taskflow.read", "taskflow.write", "taskflow.dispatch"]).toContain(t.options.permission)
       expect(t.options.codemode).toBe(false)

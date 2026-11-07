@@ -19,6 +19,7 @@ import { detectBaseBranch, mainCheckout, worktreePaths, worktreeRoot } from "./c
 import { guard, roleRules, type RepoLayout } from "./core/guard.ts"
 import { resolveChain, type AvailableModel } from "./core/models.ts"
 import { info, loadTasks } from "./core/tasks.ts"
+import { taskStandards, type StandardsContext } from "./core/standards.ts"
 import { ROLE_DESCRIPTIONS, roleMode, rolePrompt } from "./roles.ts"
 import { buildTools, childResult, dispatchChain, taskWorktree, type DispatchInput, type DispatchResult } from "./tools.ts"
 
@@ -30,6 +31,19 @@ export const PLUGIN_ID = "taskflow"
 
 const modelRef = (m: { providerID: string; id: string; variant?: string }) => ({ providerID: m.providerID, id: m.id, ...(m.variant ? { variant: m.variant } : {}) })
 const modelString = (m: { providerID: string; id: string; variant?: string } | null) => (m ? `${m.providerID}/${m.id}${m.variant ? `#${m.variant}` : ""}` : null)
+
+interface DispatchBinding {
+  version: 1
+  role: Role
+  agent: string
+  task: string | null
+  parentSessionID: string
+  directory: string
+}
+function dispatchBinding(value: any): DispatchBinding | null {
+  if (!value || value.version !== 1 || !ROLES.includes(value.role) || value.role === "lead" || typeof value.agent !== "string" || !value.agent || !(value.task === null || (typeof value.task === "string" && value.task !== "")) || typeof value.parentSessionID !== "string" || !value.parentSessionID || typeof value.directory !== "string" || !path.isAbsolute(value.directory)) return null
+  return { version: 1, role: value.role, agent: value.agent, task: value.task, parentSessionID: value.parentSessionID, directory: value.directory }
+}
 
 export default define({
   id: PLUGIN_ID,
@@ -189,18 +203,45 @@ export default define({
 
     // ---- dispatch (child sessions) ----
     const running = new Map<Role, number>()
+    // Host session metadata is durable across plugin reloads; cache only supports hosts that omit metadata on get.
+    // No source snapshot or approval database: every continuation still loads the current task binding.
+    const children = new Map<string, DispatchBinding>()
     const dispatch = async (input: DispatchInput): Promise<DispatchResult> => {
       if (input.signal.aborted) throw new Error("aborted")
       const cfg = config()
       const agent = agentName(cfg, input.role)
+      let taskID = input.task
+      let boundDirectory: string | undefined
+      if (input.sessionID) {
+        const response: any = await ctx.session.get({ sessionID: input.sessionID as any })
+        const child = response?.data ?? response
+        const cached = children.get(input.sessionID)
+        const metadata = child?.metadata?.taskflowDispatch
+        const stored = dispatchBinding(metadata)
+        if (metadata !== undefined && !stored) throw new Error("invalid taskflow dispatch metadata; start a new child session")
+        if (cached && stored && JSON.stringify(cached) !== JSON.stringify(stored)) throw new Error("child dispatch association changed; start a new child session")
+        const binding = stored ?? cached
+        if (!binding) throw new Error("cannot recover child task/role association; start a new child with explicit role and task (legacy or metadata-less session after reload)")
+        if (child?.id !== input.sessionID || child.agent !== binding.agent || (child.parentID !== undefined && child.parentID !== binding.parentSessionID) || (!cached && child.parentID !== binding.parentSessionID)) throw new Error("child session identity/agent/parent does not match its dispatch association")
+        if (binding.role !== input.role || binding.agent !== agent) throw new Error(`child role/agent is bound to ${binding.role}/${binding.agent}; it cannot be changed by continuation`)
+        if (binding.parentSessionID !== input.parentSessionID) throw new Error("child session belongs to a different parent")
+        if (input.task !== undefined && input.task !== binding.task) throw new Error(`child task is bound to ${binding.task ?? "no task"}; contradictory task identity`)
+        if (child.location?.directory !== binding.directory || (input.directory !== undefined && path.resolve(mainDir, input.directory) !== binding.directory)) throw new Error("child working directory does not match its dispatch association")
+        taskID = binding.task ?? undefined
+        boundDirectory = binding.directory
+        children.set(input.sessionID, binding)
+      }
       let task: { size?: string; area?: string } | null = null
-      const wt = input.task ? taskWorktree(root, cfg, input.task) : null
-      if (input.task) {
-        const doc = loadTasks(wt ?? root, cfg).find((d) => asString(d.data?.id) === input.task)
-        if (doc) task = info(doc)
+      let standards: StandardsContext = taskStandards(root, cfg, undefined)
+      const wt = taskID ? taskWorktree(root, cfg, taskID) : null
+      if (taskID) {
+        const doc = loadTasks(wt ?? root, cfg).find((d) => asString(d.data?.id) === taskID)
+        if (!doc?.data) throw new Error(`task ${taskID} not found or missing frontmatter in ${wt ?? root}`)
+        task = info(doc)
+        standards = taskStandards(wt ?? root, cfg, doc.data.standards)
       }
       // the reviewer reads the PR through git and never works inside the implementer's worktree
-      const directory = input.directory ? path.resolve(mainDir, input.directory) : input.role === "reviewer" ? mainDir : (wt ?? mainDir)
+      const directory = boundDirectory ?? (input.directory ? path.resolve(mainDir, input.directory) : input.role === "reviewer" ? mainDir : (wt ?? mainDir))
       const { chain, category } = dispatchChain(cfg, input.role, task)
       if (!available.length) await refreshModels()
       const model = resolveChain(chain, available).model
@@ -211,23 +252,26 @@ export default define({
       try {
         let sessionID = input.sessionID
         if (!sessionID) {
+          const binding: DispatchBinding = { version: 1, role: input.role, agent, task: taskID ?? null, parentSessionID: input.parentSessionID, directory }
           const s: any = await ctx.session.create({
             parentID: input.parentSessionID as any,
             agent: agent as any,
             ...(model ? { model: modelRef(model) as any } : {}),
             location: { directory } as any,
-            title: `${input.role}${input.task ? ` ${input.task}` : ""}${category ? ` [${category}]` : ""}`,
+            title: `${input.role}${taskID ? ` ${taskID}` : ""}${category ? ` [${category}]` : ""}`,
+            metadata: { taskflowDispatch: { ...binding } },
           })
           const id = s?.id ?? s?.data?.id
           if (typeof id !== "string" || !id) throw new Error("session.create returned no session id")
           sessionID = id
+          children.set(id, binding)
         }
         const sid = sessionID
         if (input.signal.aborted) {
           await ctx.session.interrupt({ sessionID: sid as any } as any).catch(() => {})
           throw new Error("aborted")
         }
-        const header = [input.task ? `Task: ${input.task}` : "", `Working directory: ${directory} (run every shell command there).`].filter(Boolean).join("\n")
+        const header = [taskID ? `Task: ${taskID}` : "", `Working directory: ${directory} (run every shell command there).`, `Standards binding source: ${wt ?? root}`, standards.text].filter(Boolean).join("\n")
         let timedOut = false
         const interrupt = () => void ctx.session.interrupt({ sessionID: sid as any } as any).catch(() => {})
         input.signal.addEventListener("abort", interrupt, { once: true })
@@ -246,7 +290,7 @@ export default define({
         const messages: any = await ctx.session.context({ sessionID: sid as any } as any)
         const r = childResult(Array.isArray(messages) ? messages : (messages?.data ?? []))
         const error = timedOut ? `timed out after ${cfg.dispatch.timeoutMinutes} min and was interrupted${r.error ? `; ${r.error}` : ""}` : input.signal.aborted ? "aborted by the caller" : r.error
-        return { sessionID: sid, agent, model: modelString(model), directory, text: r.text, outcome: r.outcome, error }
+        return { sessionID: sid, agent, model: modelString(model), directory, text: r.text, outcome: r.outcome, error, standards: standards.sources.flatMap((s) => s.ids.map((id) => ({ id, path: s.path, sha256: s.sha256 }))) }
       } finally {
         running.set(input.role, Math.max(0, (running.get(input.role) ?? 1) - 1))
       }

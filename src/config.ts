@@ -65,6 +65,8 @@ export interface TaskflowConfig {
   parallel: number
   /** Child sessions started by tf_dispatch. */
   dispatch: { timeoutMinutes: number }
+  /** Optional reference index; a missing index is harmless until ids are selected. */
+  standards: { index: string; roots: string[]; maxContextChars: number }
   agents: Partial<Record<Role, AgentConfig>>
   categories: Record<string, CategoryConfig>
   routing: RoutingRule[]
@@ -111,6 +113,7 @@ export function defaultConfig(humanLanguage = "ru"): TaskflowConfig {
     review: { maxRounds: 3, autoMerge: true, mergeMethod: "squash" },
     parallel: 2,
     dispatch: { timeoutMinutes: 180 },
+    standards: { index: "docs/standards/index.json", roots: ["docs", "AGENTS.md"], maxContextChars: 24_000 },
     agents: {
       // Chains are tried in order; models your providers do not serve are skipped.
       // Reviewer deliberately prefers a different model family than the implementer (cross-model review).
@@ -295,6 +298,8 @@ const SCHEMA: Array<[string, Check]> = [
   ["board.header", isStrArray], ["board.epicLine", isStr], ["board.epicLink", isStr], ["board.taskLine", isStr],
   ["review.maxRounds", isPosInt], ["review.autoMerge", isBool], ["review.mergeMethod", oneOf("squash", "merge", "rebase")],
   ["parallel", isPosInt], ["dispatch.timeoutMinutes", (v) => isPosInt(v) && (v as number) <= 1440], ["routing", isRouting], ["commandPrefix", isStr],
+  ["standards.index", isNonEmpty], ["standards.roots", (v) => isStrArray(v) && (v as string[]).every((x) => x.trim() !== "")],
+  ["standards.maxContextChars", (v) => isPosInt(v) && (v as number) <= 1_000_000],
 ]
 
 const getPath = (o: any, p: string) => p.split(".").reduce((a, k) => (a == null ? undefined : a[k]), o)

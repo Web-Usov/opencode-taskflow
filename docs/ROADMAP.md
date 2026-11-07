@@ -9,6 +9,9 @@
 
 ## Next
 
+- **Standards profiles across projects**: optional reusable engineering standards with explicit project overrides;
+  keep project-specific business rules local. Discovery/indexing/shaping are already implemented on the standards branch.
+
 - **Live PR loop test** against a throwaway GitHub repository (ship → review → auto-merge → clean); today the e2e script
   covers everything up to the push, the PR/merge part is covered by unit tests and prompts only.
 - **Event-driven model refresh** (`ctx.event.subscribe` on provider/model updates) instead of fixed retries; skip

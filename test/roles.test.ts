@@ -104,7 +104,7 @@ describe("prompts and commands", () => {
   })
   test("commands are prefixed and render arguments", () => {
     const specs = commandSpecs(cfg(), layout)
-    expect(specs.map((s) => s.name)).toEqual(["tf-next", "tf-ship", "tf-review", "tf-handoff", "tf-status", "tf-plan", "tf-drive", "tf-milestone", "tf-init", "tf-doctor"])
+    expect(specs.map((s) => s.name)).toEqual(["tf-next", "tf-ship", "tf-review", "tf-handoff", "tf-status", "tf-plan", "tf-discover", "tf-standards", "tf-shape", "tf-drive", "tf-milestone", "tf-init", "tf-doctor"])
     expect(specs.find((s) => s.name === "tf-next")!.render(" T-007 ")).toContain('id "T-007"')
     expect(specs.find((s) => s.name === "tf-next")!.render("")).toContain("tf_next")
     expect(specs.find((s) => s.name === "tf-drive")!.switchTo).toBe("lead")
