@@ -2,13 +2,13 @@
 id: T-000
 title: Short imperative title
 status: todo          # todo | in_progress | review | done | blocked
-epic: E-01            # epics/E-xx-*.md
+epic: E-01            # {{epics}}/E-xx-*.md; create the actual epic first
 depends: []           # [T-001, T-002] - must be done before this task starts
 blocked_by: []        # [Q-01] - open questions that block the task
 spec: []              # rule IDs this task implements, e.g. [OP-05]
 standards: []         # Optional exact approved reference ids; never inferred from suggestions
 acceptance: []        # acceptance criteria ids, e.g. [AC-06]
-area: api             # see .opencode/taskflow.jsonc task.areas
+area: api             # see {{config}} task.areas
 size: S               # S | M  (one agent session, ~300-500 changed lines max)
 branch: null          # set by tf_start, e.g. task/T-000-slug
 pr: null              # PR url, set by the last commit of the PR

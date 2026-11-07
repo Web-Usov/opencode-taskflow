@@ -74,7 +74,7 @@ scripts/e2e.sh         loads the plugin into the running OpenCode service and as
     reported hashes if standards changed. No approval database or immutable context snapshots are implied.
 18. **Human-gated discovery and shaping.** `/tf-discover` proposes evidence-backed conventions and asks why; `/tf-shape`
     clarifies goals/non-goals, examples, acceptance checks and open decisions before decomposition. Planner writes
-    `docs/plans/<slug>/shape.md` on a plan branch. Index status is process metadata, not authenticated sign-off. Observed
+    `<paths.plans>/<slug>/shape.md` on a plan branch. Index status is process metadata, not authenticated sign-off. Observed
     conventions and loaded documents cannot override AGENTS/spec/ADR/permissions. Shaping is prompt-guided, not a
     deterministic approval engine.
 19. **Bounded documentation reads.** Index and referenced source paths must remain within the configured roots and
@@ -85,6 +85,19 @@ scripts/e2e.sh         loads the plugin into the running OpenCode service and as
     snapshots. A continuation recovers that association and reloads/revalidates the binding even when `task` is omitted.
     Conflicting identities or unrecoverable legacy children fail closed before prompting. Session metadata round-trip
     support was checked against OpenCode 2.2.6 without model calls.
+21. **Centralized, tracked process namespace.** New projects use `.taskflow/config.jsonc`, workflow, tasks/epics,
+    plans, standards and templates under `.taskflow/`. `paths` renders all runtime process locations; no product
+    specifications are copied or moved. Init has no live example epic and no external AGENTS/GitHub writes unless
+    explicitly opted in. Standards allow the `.taskflow` hidden segment only at the top level under configured roots;
+    hidden children and secret/dependency/Git paths remain forbidden, before and after symlink resolution.
+22. **Compatibility without migration.** Central project config wins over the legacy `.opencode/taskflow.jsonc`
+    (the latter is ignored, not merged). Both discovery candidates and the global file participate in the config
+    stamp. Legacy config, a workflow ownership marker, or a strong finance board/script/template signature retain
+    legacy defaults. Explicit global legacy path pairs also retain them. Bare tasks/epics directories are not ownership
+    evidence. Init persists effective settings, using the same detected verify commands in config and workflow.
+    Moving existing project files requires a separately approved inventory and plan; no migration runs on load/init.
+    Process config, epic/template files, workflow, standards and plans are planner/human-gated independently of
+    `protected` overrides; the task directory and generated board remain writable by implementers. Shell remains best effort.
 
 ## Borrowed from oh-my-openagent
 

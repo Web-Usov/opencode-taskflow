@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import fs from "node:fs"
 import path from "node:path"
 import { commandSpecs } from "../src/commands.ts"
-import { loadConfig } from "../src/config.ts"
+import { defaultConfig, loadConfig } from "../src/config.ts"
 import { guard, roleRules } from "../src/core/guard.ts"
 import { init } from "../src/core/init.ts"
 import { loadStandards, readStandardsIndex, standardIds, suggestStandards, taskStandards, validateStandardsIndex } from "../src/core/standards.ts"
@@ -46,7 +46,7 @@ describe("standards schema and compatibility", () => {
   test("invalid config fields fall back individually without changing model chains", () => {
     const root = tmpdir()
     const { config, sources } = loadConfig(root, { standards: { index: "", roots: "docs", maxContextChars: -1 } }, "/nonexistent")
-    expect(config.standards).toEqual(cfg().standards)
+    expect(config.standards).toEqual(defaultConfig().standards)
     expect(config.agents).toEqual(cfg().agents)
     expect(sources[0]?.error).toContain("standards")
   })
@@ -270,7 +270,7 @@ describe("tool, process and scaffold boundaries", () => {
     expect(fs.existsSync(path.join(root, standards.index))).toBe(true)
     expect(fs.existsSync(path.join(root, "docs/standards/index.json"))).toBe(false)
     expect(readStandardsIndex(root, after)!.entries).toEqual([])
-    const guide = fs.readFileSync(path.join(root, "docs/standards/README.md"), "utf8")
+    const guide = fs.readFileSync(path.join(root, after.paths.standardsGuide), "utf8")
     expect(guide).toContain("`policy/index.json`")
     expect(guide).toContain('"path": "policy/existing.md"')
     expect(guide).toContain('`roots` (["policy"])')

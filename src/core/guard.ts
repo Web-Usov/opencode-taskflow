@@ -12,7 +12,14 @@ export interface Rule {
 export const TOOL_PERMISSION = { read: "taskflow.read", write: "taskflow.write", dispatch: "taskflow.dispatch" } as const
 
 /** Process artifacts always require the planner/human gate, independent of project protected overrides. */
-export const protectedPaths = (cfg: TaskflowConfig): string[] => [...cfg.protected, cfg.standards.index, "docs/standards/**", "docs/plans/**"]
+export function protectedPaths(cfg: TaskflowConfig): string[] {
+  // An index/guide at the namespace root must not accidentally protect the task directory or board.
+  const directory = (file: string) => {
+    const dir = path.posix.dirname(file)
+    return dir === "." || [cfg.paths.tasks, cfg.paths.board].some((p) => p === dir || p.startsWith(dir + "/")) ? [] : [`${dir}/**`]
+  }
+  return [...cfg.protected, cfg.paths.config, `${cfg.paths.epics}/**`, cfg.standards.index, cfg.paths.standardsGuide, ...directory(cfg.paths.standardsGuide), ...directory(cfg.standards.index), `${cfg.paths.plans}/**`, cfg.paths.workflow, cfg.paths.template, cfg.paths.epicTemplate, cfg.paths.prTemplate, cfg.paths.humanReviewTemplate, `${cfg.paths.milestones}/**`]
+}
 
 /** Where the repository lives, so absolute edit paths can be matched too. */
 export interface RepoLayout {
@@ -109,7 +116,7 @@ export function roleRules(cfg: TaskflowConfig, role: Role, layout: RepoLayout): 
         ...common,
         ...noMerge,
         deny("edit", "*"),
-        ...[`${cfg.paths.tasks}/**`, `${cfg.paths.epics}/**`, "docs/**", ...protectedPaths(cfg)].map((g) => allow("edit", toWildcard(g))),
+        ...[`${cfg.paths.tasks}/**`, cfg.paths.board, `${cfg.paths.epics}/**`, "docs/**", ...protectedPaths(cfg)].map((g) => allow("edit", toWildcard(g))),
         ...tools(true, false),
       ]
     case "lead":

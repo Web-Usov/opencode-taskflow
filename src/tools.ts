@@ -423,18 +423,18 @@ export function buildTools(host: ToolHost): ToolDef[] {
     {
       name: "tf_init",
       permission: TOOL_PERMISSION.write,
-      description: "Scaffold the taskflow process in this repository without overwriting anything: .opencode/taskflow.jsonc (with detected verify/setup commands), task template, epics README and example, PR templates, docs/taskflow.md, empty standards reference index and guide, AGENTS.md section, task board. Never invent approved conventions.",
-      input: obj({ language: str("Human language code for human-facing texts, e.g. ru or en") }),
+      description: "Scaffold Taskflow using effective layout paths (fresh projects: only .taskflow/), without overwriting existing files or creating a live example epic. Empty standards index, process templates and workflow. External AGENTS/GitHub integrations require explicit opt-in. No migration or invented approvals.",
+      input: obj({ language: str("Human language code for human-facing texts, e.g. ru or en"), agentsLink: bool("Explicitly opt in to creating/appending an AGENTS.md workflow link"), githubTemplate: bool("Explicitly opt in to adding a GitHub human-review template; never overwrite") }),
       async execute(input, ctx) {
         const root = await host.sessionRoot(ctx.sessionID)
-        const r = init(root, cfgNow(), host.layout(), { human: input?.language })
+        const r = init(root, cfgNow(), host.layout(), { human: input?.language, agentsLink: input?.agentsLink === true, githubTemplate: input?.githubTemplate === true })
         await host.reloadRegistrations()
         const d = r.detected
         return [
           `created in ${root}:\n${r.created.map((c) => `  + ${c}`).join("\n") || "  (nothing)"}`,
           r.skipped.length ? `kept existing:\n${r.skipped.map((c) => `  = ${c}`).join("\n")}` : "",
           `detected: package manager ${d.packageManager ?? "-"}, install ${d.install ?? "-"}, verify ${d.verify.full ?? "-"}, quick ${d.verify.quick ?? "-"}, e2e ${d.verify.e2e ?? "-"}, base ${d.baseBranch}, repo ${d.repo ?? "-"}`,
-          "Review .opencode/taskflow.jsonc (verify commands, CI checks, protected paths, areas, env files), then commit the scaffold.",
+          `Review ${cfgNow().paths.config} (verify commands, CI checks, protected paths, areas, env files), then commit the scaffold. No existing files moved; legacy migration needs a separate approved inventory and plan.`,
         ]
           .filter(Boolean)
           .join("\n")

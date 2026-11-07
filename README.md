@@ -18,7 +18,7 @@ oh-my-openagent) и ограничения прав — одной строко�
 нарушения маловероятными и заметными, но не заменяет их.
 
 Процесс целиком описан в контракте, который получает каждая роль (`src/roles.ts`, функция `contract`), и в
-`docs/taskflow.md`, который создаёт `/tf-init`.
+`.taskflow/workflow.md`, который создаёт `/tf-init` (или настроенном legacy-пути).
 
 ## Установка
 
@@ -39,9 +39,10 @@ git clone git@github.com:Web-Usov/opencode-taskflow.git ~/plugins/opencode-taskf
 
 ## Быстрый старт в проекте
 
-1. `/tf-init` — создаёт `.opencode/taskflow.jsonc` (с найденными командами проверки и установки), шаблон задачи,
-   README эпиков, пример эпика, шаблоны PR, `docs/taskflow.md`, секцию в `AGENTS.md` и доску задач. Ничего не перезаписывает.
-2. Поправьте `.opencode/taskflow.jsonc` (команды проверки, обязательные CI-проверки, защищённые пути, области задач,
+1. `/tf-init` — создаёт только `.taskflow/`: конфиг с найденными командами проверки/установки, workflow, доску задач,
+   README эпиков, пустой индекс стандартов, руководство и шаблоны задач/эпиков/PR. Живого примера эпика нет.
+   Существующие документы не перезаписываются. `AGENTS.md` и `.github/` по умолчанию не меняются.
+2. Поправьте `.taskflow/config.jsonc` (команды проверки, обязательные CI-проверки, защищённые пути, области задач,
    env-файлы для worktree) и закоммитьте.
 3. Для существующего проекта `/tf-discover api` помогает выявить и обсудить неявные соглашения. `/tf-standards` показывает индекс правил и помогает выбрать нужные. Если требования неясны, начните с `/tf-shape <функция>`, затем `/tf-plan E-01`: planner в своём worktree `plan/<slug>` раскладывает подтверждённый объём на задачи (PR на ревью человеку).
 4. `/tf-next` — список готовых задач с рекомендацией. `/tf-next T-001` — захват задачи кодом (worktree, ветка,
@@ -52,15 +53,17 @@ git clone git@github.com:Web-Usov/opencode-taskflow.git ~/plugins/opencode-taskf
 
 ## Конфигурация
 
-Слои (каждый следующий важнее): встроенные значения → `~/.config/opencode/taskflow.jsonc` → `.opencode/taskflow.jsonc`
-проекта → `options` плагина в `opencode.json`. Объекты сливаются, массивы заменяются.
+Слои (каждый следующий важнее): встроенные значения → `~/.config/opencode/taskflow.jsonc` → конфиг проекта →
+`options` плагина в `opencode.json`. Конфиг проекта: `.taskflow/config.jsonc`, при его отсутствии —
+`.opencode/taskflow.jsonc`. Когда есть оба, старый проектный слой **не сливается**; `/tf-doctor` сообщает приоритет.
+Объекты сливаются, массивы заменяются. Все пути процесса настраиваются в `paths`, индекс — в `standards.index`.
 
 ```jsonc
 {
   "language": { "human": "ru", "agent": "en" },        // язык для человека и для агентских артефактов
   "git": { "remote": "origin", "baseBranch": null,      // null = определить (origin/HEAD, main, master)
            "branchPrefix": "task/", "worktreeDir": "../{repo}-wt" },
-  "paths": { "tasks": "tasks", "epics": "epics", "board": "tasks/README.md", "template": "tasks/_template.md" },
+  "paths": { "tasks": ".taskflow/tasks", "epics": ".taskflow/epics", "board": ".taskflow/tasks/README.md", "template": ".taskflow/templates/task.md" },
   "task": { "areas": ["api", "web", "mobile", "infra", "docs"], "sizes": ["S", "M"], "idPadding": 3 },
   "setup": {                                             // выполняется в каждом новом worktree
     "copy": ["apps/api/.env", { "to": "apps/api/.env.test", "from": ["apps/api/.env.test", "apps/api/.env.test.example"] }],
@@ -68,9 +71,9 @@ git clone git@github.com:Web-Usov/opencode-taskflow.git ~/plugins/opencode-taskf
   },
   "verify": { "full": "pnpm verify", "quick": "pnpm verify:quick", "e2e": "pnpm e2e:smoke" },
   "ci": { "checks": ["verify", "contract", "e2e"] },
-  "protected": ["docs/spec/**", "docs/decisions/**", "epics/**"],
+  "protected": ["docs/spec/**", "docs/decisions/**", ".taskflow/epics/**"],
   "qaPaths": ["e2e/**"],
-  "standards": { "index": "docs/standards/index.json", "roots": ["docs", "AGENTS.md"], "maxContextChars": 24000 },
+  "standards": { "index": ".taskflow/standards/index.json", "roots": [".taskflow", "docs", "AGENTS.md"], "maxContextChars": 24000 },
   "spec": null,                                          // или { dir, definition, questions, questionPattern, acceptancePattern }
   "review": { "maxRounds": 3, "autoMerge": true, "mergeMethod": "squash" },
   "parallel": 2,                                         // максимум одновременных implementer'ов в /tf-drive
@@ -86,6 +89,40 @@ git clone git@github.com:Web-Usov/opencode-taskflow.git ~/plugins/opencode-taskf
   "commandPrefix": "tf-"
 }
 ```
+
+### Расположение и совместимость
+
+```text
+.taskflow/
+  config.jsonc
+  workflow.md
+  tasks/README.md           # доска; рядом T-NNN-slug.md
+  epics/README.md           # рядом только настоящие E-NN-slug.md
+  plans/<slug>/shape.md     # создаёт planner при уточнении требований
+  standards/index.json     # пустой при init
+  standards/README.md
+  templates/task.md
+  templates/epic.md         # шаблон, не живой эпик
+  templates/pull-request.md
+  templates/human-review.md
+```
+
+Всё состояние процесса хранится в Git проекта. `paths` также включает `workflow`, `plans`, `standardsGuide`,
+`epicTemplate`, `prTemplate`, `humanReviewTemplate`, `milestones`. `paths.config` — эффективный путь обнаруженного
+проектного конфига, а не способ перенести его через глобальную настройку.
+
+Legacy-проектный конфиг сохраняет старые defaults и явные переопределения. Без конфига legacy определяется только
+по workflow с маркером `opencode-taskflow` либо finance-сигнатуре: board с `scripts/tasks.mjs`, сам скрипт и
+`tasks/_template.md`. Одних папок `tasks/` и `epics/` недостаточно. Явные глобальные legacy paths
+(`tasks: "tasks"` плюс `epics: "epics"` или `template: "tasks/_template.md"`) также сохраняются.
+Повторный init не переносит файлы и не создаёт вторую раскладку; legacy PR-шаблоны по умолчанию лежат в
+`docs/taskflow-templates/`. Для будущей миграции сначала согласуйте инвентаризацию путей и отдельный план перемещений,
+затем явно одобрите изменения. Автоматической миграции нет.
+
+Спецификации, ADR и существующие AGENTS/CLAUDE остаются каноническими на своих местах; init их не копирует и не переносит.
+Необязательные интеграции доступны только явно: `tf_init` с `agentsLink: true` добавляет workflow-ссылку в AGENTS.md
+(сохраняя текст), `githubTemplate: true` добавляет отсутствующий `.github/PULL_REQUEST_TEMPLATE/human-review.md`.
+Существующий GitHub-шаблон никогда не заменяется.
 
 Полные значения по умолчанию — `defaultConfig()` в `src/config.ts`. Неверные значения (не тот тип, неизвестный
 `mergeMethod`, битое регулярное выражение в `spec`) заменяются значениями по умолчанию по одному полю, а проблема
@@ -110,7 +147,7 @@ git clone git@github.com:Web-Usov/opencode-taskflow.git ~/plugins/opencode-taskf
 
 - **`/tf-discover [область]`** — изучить код и тесты, собрать примеры и исключения, спросить причину решений. Наблюдения не становятся правилами автоматически: planner оформляет изменения после явного подтверждения человека, PR сливает человек.
 - **`/tf-standards [запрос или id]`** — найти подходящие правила по индексу, затем загрузить только явно выбранные. Это ссылки на существующие `AGENTS.md`, спецификации и ADR, а не вторая копия требований.
-- **`/tf-shape <функция>`** — уточнить цель, не-цели, примеры, крайние случаи и проверяемую приёмку. Planner сохраняет `docs/plans/<slug>/shape.md` с открытыми вопросами и статусом подтверждения; до решения блокирующих вопросов не начинает реализацию.
+- **`/tf-shape <функция>`** — уточнить цель, не-цели, примеры, крайние случаи и проверяемую приёмку. Planner сохраняет `.taskflow/plans/<slug>/shape.md` (или `paths.plans`) с открытыми вопросами и статусом подтверждения; до решения блокирующих вопросов не начинает реализацию.
 
 `/tf-init` создаёт пустой индекс и руководство, не перезаписывая существующие документы. Старые задачи без `standards` работают как раньше. Новая задача может содержать `standards: [api-errors]`: `tf_check` проверяет привязку, а `tf_dispatch` передаёт исполнителю и ревьюеру выбранные источники из worktree задачи с путями и SHA-256. Автоматического выбора по подсказке нет.
 

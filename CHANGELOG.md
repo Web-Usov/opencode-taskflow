@@ -2,6 +2,11 @@
 
 ## 0.2.0 — unreleased
 
+- Fresh projects keep all Taskflow process artifacts under tracked `.taskflow/`, with configurable workflow, plans and
+  templates. Central config takes precedence over legacy project config; existing legacy layouts remain supported,
+  without automatic moves. Init no longer creates a live sample epic or touches AGENTS/GitHub without explicit opt-in.
+- Config/workflow detection stays consistent; central standards reads retain hidden-path and symlink confinement.
+  Planner/human protections cover effective metadata paths while task updates remain available to implementers.
 - Reference-only standards index and optional task `standards` bindings. Existing tasks and finance board output remain
   compatible; no index is required until a task explicitly selects standards.
 - Read-only `tf_standards` tool: list, deterministic suggestions, explicit bounded loading and validation. Source paths

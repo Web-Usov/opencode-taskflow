@@ -46,33 +46,11 @@ export function detect(root: string): Detected {
   return { packageManager: pm, install, verify, baseBranch: detectBaseBranch(root, "origin", null), repo }
 }
 
-export function renderProjectConfig(d: Detected, human: string, standards = defaultConfig().standards): string {
-  const j = (v: unknown) => JSON.stringify(v)
-  return `{
-  // opencode-taskflow project config. Global defaults: ~/.config/opencode/taskflow.jsonc. Reference: plugin README.
-  "language": { "human": ${j(human)}, "agent": "en" },
-  "git": { "remote": "origin", "baseBranch": ${j(d.baseBranch)}, "branchPrefix": "task/", "worktreeDir": "../{repo}-wt" },
-  "task": { "areas": ["api", "web", "mobile", "infra", "docs"], "sizes": ["S", "M"] },
-  // Files copied from the main checkout into every new worktree (git-ignored env files), and commands run there.
-  "setup": { "copy": [], "commands": ${j(d.install ? [d.install] : [])} },
-  "verify": { "full": ${j(d.verify.full)}, "quick": ${j(d.verify.quick)}, "e2e": ${j(d.verify.e2e)} },
-  // Required CI checks (names of GitHub status checks).
-  "ci": { "checks": [] },
-  // Only the planner edits these; PRs touching them wait for the human.
-  "protected": ["docs/spec/**", "docs/decisions/**", "epics/**"],
-  "qaPaths": ["e2e/**"],
-  // Reference index only: status is a routing hint, not authenticated human sign-off.
-  "standards": ${j(standards)},
-  "review": { "maxRounds": 3, "autoMerge": true, "mergeMethod": "squash" },
-  "parallel": 2,
-  // Model chains per role: first model your providers serve wins. Uncomment to override the global defaults.
-  // "agents": { "implementer": { "models": ["anthropic/claude-opus-5-5#medium"] } },
-  // Route implementer tasks to categories by size/area (categories are defined globally or here).
-  "routing": [
-    { "when": { "size": "S" }, "category": "quick" }
-  ]
-}
-`
+export function renderProjectConfig(d: Detected, human: string, standards = defaultConfig().standards, effective?: TaskflowConfig): string {
+  const cfg = effective ?? { ...defaultConfig(human), standards, verify: d.verify, setup: { copy: [], commands: d.install ? [d.install] : [] } }
+  // Keep model selection inherited from global config/options, rather than freezing its chains into every project.
+  const { agents: _agents, categories: _categories, ...project } = cfg
+  return `// opencode-taskflow: effective project settings; existing product documents remain canonical.\n${JSON.stringify({ ...project, language: { ...cfg.language, human } }, null, 2)}\n`
 }
 
 export interface InitResult {
@@ -82,7 +60,7 @@ export interface InitResult {
 }
 
 /** Scaffolds the process files. Never overwrites an existing file. */
-export function init(root: string, cfg: TaskflowConfig, layout: RepoLayout, opts: { human?: string } = {}): InitResult {
+export function init(root: string, cfg: TaskflowConfig, layout: RepoLayout, opts: { human?: string; agentsLink?: boolean; githubTemplate?: boolean } = {}): InitResult {
   const human = opts.human ?? cfg.language.human
   const created: string[] = []
   const skipped: string[] = []
@@ -98,39 +76,54 @@ export function init(root: string, cfg: TaskflowConfig, layout: RepoLayout, opts
   }
   const tpl = (rel: string) => fs.readFileSync(path.join(TEMPLATES_DIR, rel), "utf8")
   const detected = detect(root)
+  // Persist the same effective verification/settings used in the generated workflow.
+  const existingConfig = fs.existsSync(path.join(root, cfg.paths.config))
+  cfg = {
+    ...cfg,
+    language: { ...cfg.language, human },
+    board: JSON.stringify(cfg.board) === JSON.stringify(defaultConfig(cfg.language.human).board) ? defaultConfig(human).board : cfg.board,
+    git: { ...cfg.git, baseBranch: cfg.git.baseBranch ?? detected.baseBranch },
+    verify: existingConfig ? cfg.verify : {
+      full: cfg.verify.full ?? detected.verify.full,
+      quick: cfg.verify.quick ?? detected.verify.quick,
+      e2e: cfg.verify.e2e ?? detected.verify.e2e,
+    },
+    setup: { ...cfg.setup, commands: cfg.setup.commands.length ? cfg.setup.commands : detected.install ? [detected.install] : [] },
+  }
 
   // Validate scaffold destinations before writing; existing index/docs are never replaced.
   standardFile(root, cfg.standards.index, cfg)
-  standardFile(root, "docs/standards/README.md", { ...cfg, standards: { ...cfg.standards, roots: [...cfg.standards.roots, "docs"] } })
+  standardFile(root, cfg.paths.standardsGuide, { ...cfg, standards: { ...cfg.standards, roots: [...cfg.standards.roots, path.posix.dirname(cfg.paths.standardsGuide)] } })
 
-  write(".opencode/taskflow.jsonc", renderProjectConfig(detected, human, cfg.standards))
-  write(cfg.paths.template, tpl("tasks/_template.md"))
-  write(path.join(cfg.paths.epics, "README.md"), tpl("epics/README.md"))
-  const hasEpic = fs.existsSync(path.join(root, cfg.paths.epics)) && fs.readdirSync(path.join(root, cfg.paths.epics)).some((f) => /^E-\d+.*\.md$/.test(f))
-  if (!hasEpic) write(path.join(cfg.paths.epics, "E-01-example.md"), tpl("epics/E-01-example.md"))
-  write(".github/pull_request_template.md", tpl("github/pull_request_template.md"))
-  write(".github/PULL_REQUEST_TEMPLATE/human-review.md", tpl(`github/PULL_REQUEST_TEMPLATE/human-review.${human === "ru" ? "ru" : "en"}.md`))
-  write("docs/taskflow.md", `# Workflow\n\nGenerated by opencode-taskflow \`tf_init\`; regenerate or edit freely.\n\n${contract(cfg, layout)}\n`)
+  write(cfg.paths.config, renderProjectConfig(detected, human, cfg.standards, cfg))
+  write(cfg.paths.template, tpl("tasks/_template.md").replaceAll("{{config}}", cfg.paths.config).replaceAll("{{epics}}", cfg.paths.epics))
+  write(path.join(cfg.paths.epics, "README.md"), tpl("epics/README.md").replaceAll("../tasks/", path.posix.relative(cfg.paths.epics, cfg.paths.tasks) + "/"))
+  write(cfg.paths.epicTemplate, tpl("epics/E-01-example.md"))
+  write(cfg.paths.prTemplate, tpl("github/pull_request_template.md").replaceAll("{{humanReviewTemplate}}", cfg.paths.humanReviewTemplate))
+  write(cfg.paths.humanReviewTemplate, tpl(`github/PULL_REQUEST_TEMPLATE/human-review.${human === "ru" ? "ru" : "en"}.md`))
+  if (opts.githubTemplate) write(".github/PULL_REQUEST_TEMPLATE/human-review.md", tpl(`github/PULL_REQUEST_TEMPLATE/human-review.${human === "ru" ? "ru" : "en"}.md`))
+  write(cfg.paths.workflow, `# Workflow\n\nGenerated by opencode-taskflow \`tf_init\`; regenerate or edit freely.\n\n${contract(cfg, layout)}\n`)
   write(cfg.standards.index, JSON.stringify({ version: 1, entries: [] }, null, 2) + "\n")
   const exampleRoot = cfg.standards.roots[0]!
   const examplePath = /\.(md|txt|rst|adoc)$/i.test(exampleRoot) ? exampleRoot : `${exampleRoot}/existing.md`
   const guide = tpl(`standards/README.${human === "ru" ? "ru" : "en"}.md`)
+    .replaceAll("docs/plans/<slug>/shape.md", `${cfg.paths.plans}/<slug>/shape.md`)
     .replaceAll("`index.json`", `\`${cfg.standards.index}\``)
     .replaceAll('"path": "docs/existing.md"', `"path": ${JSON.stringify(examplePath)}`)
     .replaceAll("`roots` (default `docs`, `AGENTS.md`)", `\`roots\` (${JSON.stringify(cfg.standards.roots)})`)
     .replaceAll("`roots` (по умолчанию `docs`, `AGENTS.md`)", `\`roots\` (${JSON.stringify(cfg.standards.roots)})`)
     .replaceAll("`maxContextChars` (24000)", `\`maxContextChars\` (${cfg.standards.maxContextChars})`)
-  write("docs/standards/README.md", guide)
+  write(cfg.paths.standardsGuide, guide)
 
   const agentsMd = path.join(root, "AGENTS.md")
-  const section = `\n## Workflow (opencode-taskflow)\n\nTasks, worktrees, PRs and reviews follow \`docs/taskflow.md\`. Roles: lead, planner, implementer, reviewer, qa. Start with \`/${cfg.commandPrefix}status\` or \`/${cfg.commandPrefix}next\`.\n`
-  if (!fs.existsSync(agentsMd)) {
+  const section = `\n## Workflow (opencode-taskflow)\n\nTasks, worktrees, PRs and reviews follow \`${cfg.paths.workflow}\`. Roles: lead, planner, implementer, reviewer, qa. Start with \`/${cfg.commandPrefix}status\` or \`/${cfg.commandPrefix}next\`.\n`
+  if (opts.agentsLink && !fs.existsSync(agentsMd)) {
     fs.writeFileSync(agentsMd, `# Agent guide\n${section}`)
     created.push("AGENTS.md")
-  } else if (!fs.readFileSync(agentsMd, "utf8").includes("opencode-taskflow")) {
+  } else if (opts.agentsLink && !fs.readFileSync(agentsMd, "utf8").includes("opencode-taskflow")) {
     fs.appendFileSync(agentsMd, section)
     created.push("AGENTS.md (workflow section appended)")
-  } else skipped.push("AGENTS.md")
+  } else if (opts.agentsLink) skipped.push("AGENTS.md")
 
   const board = writeBoard(root, cfg)
   if (board.written) created.push(cfg.paths.board)

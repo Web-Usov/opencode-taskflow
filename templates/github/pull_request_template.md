@@ -1,4 +1,4 @@
-<!-- Agent-only PRs (auto-merged after review) use this template. PRs that touch protected paths (spec, decisions, epics) or are milestone reports use .github/PULL_REQUEST_TEMPLATE/human-review.md and wait for the human. -->
+<!-- Agent-only PRs (auto-merged after review) use this template. PRs that touch protected paths (spec, decisions, epics) or are milestone reports use {{humanReviewTemplate}} and wait for the human. -->
 
 ## Task
 

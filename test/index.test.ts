@@ -189,14 +189,16 @@ describe("standards dispatch integration (no live models)", () => {
   })
 })
 
-function makeRepo() {
-  return repoWithOrigin({
+function makeRepo(central = false) {
+  const files = {
     ".opencode/taskflow.jsonc": CONFIG,
     "tasks/_template.md": TEMPLATE,
     "epics/E-01-core.md": epicFile("E-01"),
     "tasks/T-001-first-task.md": taskFile({ id: "T-001", title: "First task" }),
     "tasks/README.md": "",
-  })
+  }
+  if (!central) return repoWithOrigin(files)
+  return repoWithOrigin(Object.fromEntries(Object.entries(files).map(([file, content]) => [file === ".opencode/taskflow.jsonc" ? ".taskflow/config.jsonc" : file === "tasks/_template.md" ? ".taskflow/templates/task.md" : `.taskflow/${file}`, content])))
 }
 
 /** A fake OpenCode plugin context that records transforms, hooks and session calls. */
@@ -265,9 +267,9 @@ function fakeCtx(directory: string, sessions = new Map<string, any>()) {
   return { ctx, agents, commands, tools, hooks, calls, replay, sessions }
 }
 
-async function boot(overrides: Record<string, unknown> = {}) {
-  const repo = makeRepo()
-  if (Object.keys(overrides).length) write(repo.main, ".opencode/taskflow.jsonc", JSON.stringify({ ...JSON.parse(CONFIG), ...overrides }))
+async function boot(overrides: Record<string, unknown> = {}, central = false) {
+  const repo = makeRepo(central)
+  if (Object.keys(overrides).length) write(repo.main, central ? ".taskflow/config.jsonc" : ".opencode/taskflow.jsonc", JSON.stringify({ ...JSON.parse(CONFIG), ...overrides }))
   const f = fakeCtx(repo.main)
   const plugin = (await import("../src/index.ts")).default
   const cleanup: any = await plugin.setup(f.ctx)
@@ -276,6 +278,43 @@ async function boot(overrides: Record<string, unknown> = {}) {
 }
 
 describe("plugin entry with a fake OpenCode context", () => {
+  test("central task dispatch and continuation preserve worker/reviewer sources and fail closed", async () => {
+    const h = await boot({}, true)
+    try {
+      const wt = path.join(h.dir, "central-worktree")
+      sh("git", ["worktree", "add", "-q", "-b", "task/T-001-bound", wt], h.main)
+      write(wt, ".taskflow/standards/index.json", JSON.stringify({ version: 1, entries: [{ id: "central", title: "Central rule", path: ".taskflow/standards/rule.md", status: "approved" }] }))
+      write(wt, ".taskflow/standards/rule.md", "CURRENT CENTRAL SOURCE")
+      write(wt, ".taskflow/tasks/T-001-first-task.md", taskFile({ id: "T-001" }).replace("spec: []", "spec: []\nstandards: [central]"))
+      const tool = h.tools.find((t) => t.name === "tf_dispatch")
+      const context = { sessionID: "ses_parent", agent: "lead", signal: new AbortController().signal }
+      const implementation = await tool.execute({ role: "implementer", task: "T-001", prompt: "implement" }, context)
+      const sessionID = implementation.content.match(/child session: (\S+)/)![1]
+      const review = await tool.execute({ role: "reviewer", task: "T-001", prompt: "review" }, context)
+      expect(implementation.content).toContain("central -> .taskflow/standards/rule.md (sha256")
+      expect(review.content).toContain(implementation.content.match(/central -> .*\)/)![0])
+      const prompts = h.calls.filter((c) => c.fn === "session.prompt").map((c) => c.arg.text)
+      expect(prompts[0].slice(prompts[0].indexOf("Standards binding source:"), prompts[0].indexOf("\n\nimplement"))).toBe(prompts[1].slice(prompts[1].indexOf("Standards binding source:"), prompts[1].indexOf("\n\nreview")))
+      expect((await tool.execute({ role: "implementer", sessionID, prompt: "continue" }, context)).content).toContain("central -> .taskflow/standards/rule.md")
+      write(wt, ".taskflow/standards/index.json", '{"version":1,"entries":[]}')
+      const before = h.calls.filter((c) => c.fn === "session.prompt").length
+      expect((await tool.execute({ role: "implementer", sessionID, prompt: "must fail" }, context)).content).toContain("unknown standards id")
+      expect(h.calls.filter((c) => c.fn === "session.prompt")).toHaveLength(before)
+    } finally { h.cleanup() }
+  }, T)
+
+  test("selected centralized config mtime reloads tool settings and registrations", async () => {
+    const h = await boot({}, true)
+    try {
+      write(h.main, ".taskflow/config.jsonc", JSON.stringify({ ...JSON.parse(CONFIG), verify: { full: "central-verify" } }))
+      fs.utimesSync(path.join(h.main, ".taskflow/config.jsonc"), new Date(), new Date(Date.now() + 2000))
+      const doctor = h.tools.find((t) => t.name === "tf_models")
+      expect((await doctor.execute({}, { sessionID: "ses_parent", signal: new AbortController().signal })).content).toContain("full=central-verify")
+      expect(h.calls.some((c) => c.fn === "command.reload")).toBe(true)
+      h.replay()
+      expect(h.agents.get("implementer").system).toContain("central-verify")
+    } finally { h.cleanup() }
+  }, T)
   let h: Awaited<ReturnType<typeof boot>>
   beforeAll(async () => {
     h = await boot()

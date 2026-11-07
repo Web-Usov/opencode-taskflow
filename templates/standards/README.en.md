@@ -15,7 +15,7 @@ Optional task frontmatter `standards: [existing-rule]` binds references; old tas
 Dispatch loads the same selected references from the task worktree for implementer and reviewer, reporting hashes; invalid bindings stop dispatch.
 
 Configuration `standards`: `index`, `roots` (default `docs`, `AGENTS.md`), `maxContextChars` (24000).
-Only repo-contained relative documentation paths (`.md`, `.txt`, `.rst`, `.adoc`) under allowed roots are readable. Hidden/secret/Git-ignored files, node_modules and escaping symlinks are denied. No network reads.
+Only repo-contained relative documentation paths (`.md`, `.txt`, `.rst`, `.adoc`) under allowed roots are readable. Hidden/secret/Git-ignored files, node_modules and escaping symlinks are denied. The only hidden-segment exception is top-level `.taskflow` when explicitly included in allowed roots; hidden children remain forbidden. No network reads.
 The budget includes headers and contents; excess fails without partial loading or truncation. Split oversized sources at their canonical location rather than copying them into the index.
 
 Shape before decomposition: goal, non-goals, examples, edge cases, acceptance/verification, code/design references, standards and unresolved decisions.
