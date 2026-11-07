@@ -87,6 +87,18 @@ describe("standards path isolation", () => {
     fs.symlinkSync("../private/file.md", path.join(root, "docs/alias.md"))
     expect(() => loadStandards(root, cfg(), ["x"])).toThrow("outside allowed roots")
   })
+  test.each(["id_rsa", "implementation.ts"])("documentation alias cannot expose non-documentation target %s", (target) => {
+    const root = project([entry("alias", { path: "docs/public.md" })])
+    write(root, `docs/${target}`, "SYNTHETIC NON-DOCUMENT DATA")
+    fs.symlinkSync(target, path.join(root, "docs/public.md"))
+    expect(() => readStandardsIndex(root, cfg())).toThrow("source must be a documentation file")
+    expect(() => loadStandards(root, cfg(), ["alias"])).toThrow("source must be a documentation file")
+  })
+  test("safe documentation-to-documentation source alias remains supported", () => {
+    const root = project([entry("alias", { path: "docs/public.md" })])
+    fs.symlinkSync("testing.md", path.join(root, "docs/public.md"))
+    expect(loadStandards(root, cfg(), ["alias"]).sources[0]!.content).toContain("Use deterministic tests")
+  })
   test("ignored source and ignored alias targets are denied", () => {
     const { main } = repoWithOrigin({ ".gitignore": "docs/private.md\n", "docs/standards/index.json": index([entry("x", { path: "docs/alias.md" })]) })
     write(main, "docs/private.md", "IGNORED SECRET")
@@ -154,6 +166,35 @@ describe("explicit bounded loading and relevance", () => {
     write(root, "docs/testing.md", "x")
     expect(() => loadStandards(root, cfg({ standards: { maxContextChars: 10 } }), ["api-tests"])).toThrow("nothing loaded")
   })
+  test("aggregate accounting short-circuits source reads and reserves metadata before reading", () => {
+    const entries = Array.from({ length: 20 }, (_, i) => entry(`s${i}`, { path: `docs/s${i}.md` }))
+    const root = project(entries)
+    for (const e of entries) write(root, e.path, "x".repeat(800))
+    const original = fs.readFileSync
+    const reads: string[] = []
+    ;(fs as any).readFileSync = (file: any, ...args: any[]) => {
+      if (/\/s\d+\.md$/.test(String(file))) reads.push(path.basename(String(file)))
+      return (original as any)(file, ...args)
+    }
+    try {
+      // Wrappers alone exceed this budget: do not open ANY source.
+      expect(() => loadStandards(root, cfg({ standards: { maxContextChars: 1600 } }), entries.map((e) => e.id))).toThrow("nothing loaded")
+      expect(reads).toEqual([])
+      // These wrappers fit, but contents do not: later sources remain unopened.
+      expect(() => loadStandards(root, cfg({ standards: { maxContextChars: 1600 } }), ["s0", "s1", "s2"])).toThrow("nothing loaded")
+      expect(reads).toEqual(["s0.md"])
+      reads.length = 0
+      expect(() => loadStandards(root, cfg({ standards: { maxContextChars: 10 } }), ["s0"])).toThrow("nothing loaded")
+      expect(reads).toEqual([])
+    } finally { fs.readFileSync = original }
+  })
+  test("budget reservation includes every selected id in shared-source wrappers", () => {
+    const root = project([entry("a"), entry("b")])
+    const complete = loadStandards(root, cfg(), ["b", "a"])
+    const exact = cfg({ standards: { maxContextChars: complete.text.length } })
+    expect(loadStandards(root, exact, ["b", "a"]).text).toBe(complete.text)
+    expect(() => loadStandards(root, cfg({ standards: { maxContextChars: complete.text.length - 1 } }), ["b", "a"])).toThrow("nothing loaded")
+  })
   test("binary and non-regular sources rejected", () => {
     const root = project()
     write(root, "docs/testing.md", "abc\0def")
@@ -216,6 +257,26 @@ describe("tool, process and scaffold boundaries", () => {
     expect(fs.readFileSync(path.join(root, "docs/standards/index.json"), "utf8")).toBe(custom)
     expect(fs.readFileSync(path.join(root, "docs/testing.md"), "utf8")).toBe("existing source")
     expect(fs.readFileSync(path.join(root, "docs/standards/README.md"), "utf8")).toBe("existing guide")
+  })
+  test.each(["en", "ru"])("init/reload preserves global standards settings and accurate %s guide without plugin options", (human) => {
+    const root = tmpdir()
+    const globalFile = path.join(tmpdir(), "global-taskflow.jsonc")
+    const standards = { index: "policy/index.json", roots: ["policy"], maxContextChars: 12000 }
+    fs.writeFileSync(globalFile, JSON.stringify({ language: { human }, standards }))
+    const before = loadConfig(root, undefined, globalFile).config
+    init(root, before, { ...layout, mainDir: root })
+    const after = loadConfig(root, undefined, globalFile).config
+    expect(after.standards).toEqual(standards)
+    expect(fs.existsSync(path.join(root, standards.index))).toBe(true)
+    expect(fs.existsSync(path.join(root, "docs/standards/index.json"))).toBe(false)
+    expect(readStandardsIndex(root, after)!.entries).toEqual([])
+    const guide = fs.readFileSync(path.join(root, "docs/standards/README.md"), "utf8")
+    expect(guide).toContain("`policy/index.json`")
+    expect(guide).toContain('"path": "policy/existing.md"')
+    expect(guide).toContain('`roots` (["policy"])')
+    expect(guide).toContain("`maxContextChars` (12000)")
+    expect(guide).not.toContain("24000")
+    expect(init(root, after, { ...layout, mainDir: root }).created).toEqual([])
   })
   test("prompts preserve the explicit human gate and configurable command prefix", () => {
     const c = cfg({ commandPrefix: "work-" })
