@@ -9,8 +9,8 @@ oh-my-openagent) и ограничения прав — одной строко�
 | Часть | Что делает |
 |---|---|
 | **Роли-агенты** | `lead` (оркестратор), `planner`, `implementer`, `reviewer`, `qa`. Промпты собираются из конфига проекта (команда проверки, защищённые пути, ветка, язык). Модель — первая доступная из цепочки. Права — по роли. |
-| **Инструменты `tf_*`** | `tf_status`, `tf_next`, `tf_task`, `tf_start` (worktree + ветка + env + claim-коммит), `tf_set`, `tf_check`, `tf_board`, `tf_clean`, `tf_models` (doctor), `tf_dispatch` (запуск роли дочерней сессией), `tf_init`. |
-| **Команды** | `/tf-next`, `/tf-ship`, `/tf-review`, `/tf-handoff`, `/tf-status`, `/tf-plan`, `/tf-drive`, `/tf-milestone`, `/tf-init`, `/tf-doctor`. |
+| **Инструменты `tf_*`** | `tf_status`, `tf_next`, `tf_task`, `tf_start` (worktree + ветка + env + claim-коммит), `tf_set`, `tf_check`, `tf_board`, `tf_clean`, `tf_models` (doctor), `tf_dispatch` (запуск роли дочерней сессией), `tf_init`, `tf_standards` (индекс и выборочная загрузка стандартов). |
+| **Команды** | `/tf-next`, `/tf-ship`, `/tf-review`, `/tf-handoff`, `/tf-status`, `/tf-plan`, `/tf-drive`, `/tf-milestone`, `/tf-init`, `/tf-doctor`, `/tf-discover`, `/tf-standards`, `/tf-shape`. |
 | **Guard** | Статические правила по ролям + хук прав: правки защищённых путей (и по относительным, и по абсолютным путям в worktree) — только planner; `gh pr merge` и `gh api …/merge` — только reviewer и только в точной форме `gh pr merge <n> --squash --auto` / `--disable-auto`; никто не пушит в основную ветку и не переписывает историю (`--force`, `+refspec`, `HEAD:main`). Инструменты тоже по ролям: `tf_dispatch` — только lead и сессия человека, «пишущие» `tf_*` скрыты от reviewer и qa. |
 
 **Граница гарантий.** Проверки shell-команд — по тексту команды (best effort): изменение файла через `sed -i` или
@@ -43,7 +43,7 @@ git clone git@github.com:Web-Usov/opencode-taskflow.git ~/plugins/opencode-taskf
    README эпиков, пример эпика, шаблоны PR, `docs/taskflow.md`, секцию в `AGENTS.md` и доску задач. Ничего не перезаписывает.
 2. Поправьте `.opencode/taskflow.jsonc` (команды проверки, обязательные CI-проверки, защищённые пути, области задач,
    env-файлы для worktree) и закоммитьте.
-3. `/tf-plan E-01` — planner в своём worktree `plan/<slug>` раскладывает эпик на задачи (PR на ревью человеку).
+3. Для существующего проекта `/tf-discover api` помогает выявить и обсудить неявные соглашения. `/tf-standards` показывает индекс правил и помогает выбрать нужные. Если требования неясны, начните с `/tf-shape <функция>`, затем `/tf-plan E-01`: planner в своём worktree `plan/<slug>` раскладывает подтверждённый объём на задачи (PR на ревью человеку).
 4. `/tf-next` — список готовых задач с рекомендацией. `/tf-next T-001` — захват задачи кодом (worktree, ветка,
    `in_progress`, claim-коммит), сессия переезжает в worktree и переключается на агента `implementer`.
    Или `/tf-drive` — оркестратор сам ведёт готовые задачи до слияния: implementer → reviewer → доработка
@@ -70,6 +70,7 @@ git clone git@github.com:Web-Usov/opencode-taskflow.git ~/plugins/opencode-taskf
   "ci": { "checks": ["verify", "contract", "e2e"] },
   "protected": ["docs/spec/**", "docs/decisions/**", "epics/**"],
   "qaPaths": ["e2e/**"],
+  "standards": { "index": "docs/standards/index.json", "roots": ["docs", "AGENTS.md"], "maxContextChars": 24000 },
   "spec": null,                                          // или { dir, definition, questions, questionPattern, acceptancePattern }
   "review": { "maxRounds": 3, "autoMerge": true, "mergeMethod": "squash" },
   "parallel": 2,                                         // максимум одновременных implementer'ов в /tf-drive
@@ -102,6 +103,20 @@ git clone git@github.com:Web-Usov/opencode-taskflow.git ~/plugins/opencode-taskf
 Файл `.opencode/agents/<role>.md` в проекте побеждает плагин по каждому полю, которое в нём задано (например, свой
 промпт), а незаданные поля (модель, права) остаются от плагина. Так подключаются проекты, у которых уже есть свои
 агенты. Guard-хук действует в любом случае.
+
+## Стандарты и уточнение требований
+
+Идеи Agent OS v3 адаптированы к нашему процессу без установки Agent OS и без копирования его реализации:
+
+- **`/tf-discover [область]`** — изучить код и тесты, собрать примеры и исключения, спросить причину решений. Наблюдения не становятся правилами автоматически: planner оформляет изменения после явного подтверждения человека, PR сливает человек.
+- **`/tf-standards [запрос или id]`** — найти подходящие правила по индексу, затем загрузить только явно выбранные. Это ссылки на существующие `AGENTS.md`, спецификации и ADR, а не вторая копия требований.
+- **`/tf-shape <функция>`** — уточнить цель, не-цели, примеры, крайние случаи и проверяемую приёмку. Planner сохраняет `docs/plans/<slug>/shape.md` с открытыми вопросами и статусом подтверждения; до решения блокирующих вопросов не начинает реализацию.
+
+`/tf-init` создаёт пустой индекс и руководство, не перезаписывая существующие документы. Старые задачи без `standards` работают как раньше. Новая задача может содержать `standards: [api-errors]`: `tf_check` проверяет привязку, а `tf_dispatch` передаёт исполнителю и ревьюеру выбранные источники из worktree задачи с путями и SHA-256. Автоматического выбора по подсказке нет.
+
+**Важно:** `status: "approved"` — локальные метаданные процесса, не подпись и не доказательство личности одобрившего. Источники перечитываются при каждом dispatch: между запусками они могут измениться, поэтому сравнивайте контрольные суммы в отчётах. Ошибочная или черновая привязка останавливает dispatch до запуска дочерней сессии. Превышение бюджета — явная ошибка, не молчаливая обрезка.
+
+Формат индекса, примеры и ограничения: [docs/STANDARDS.md](docs/STANDARDS.md).
 
 ## Разработка
 

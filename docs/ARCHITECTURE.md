@@ -17,6 +17,7 @@ src/core/claim.ts      claim (worktree), new-task ids, clean (port of task-start
 src/core/models.ts     model chains and routing
 src/core/guard.ts      per-role permission rules and the hard guard
 src/core/init.ts       project detection and scaffolding
+src/core/standards.ts  reference index, deterministic relevance, safe bounded source loading, task binding validation
 templates/             files tf_init copies into a project
 test/                  bun tests (unit + real git repos + parity with finance)
 scripts/e2e.sh         loads the plugin into the running OpenCode service and asserts through the HTTP API
@@ -63,9 +64,33 @@ scripts/e2e.sh         loads the plugin into the running OpenCode service and as
     *before* moving it into the worktree (the new location may not have booted the plugin yet), then prompts.
 15. **Planner worktrees.** `tf_start plan=<slug>` creates or reuses `plan/<slug>` (tracking the remote branch if only
     that exists); the planner child runs there, so its edits are relative and its static allow rules apply.
+16. **Reference-only standards.** `standards.index` is a JSON metadata index pointing to existing repository
+    documentation, not a second business specification. `tf_standards` lists/suggests from metadata and loads only
+    explicit ids. Drafts never enter worker context. The optional task frontmatter `standards` is validated before
+    dispatch and by `tf_check`; projects without bindings do not need an index. Source paths and SHA-256 are reported.
+17. **Same task sources for implementation and review.** Task bindings and source contents are read from the task's
+    worktree when it exists, even though the reviewer session itself starts in the main checkout. Both roles use the
+    same explicit binding/loader. Contents are refreshed each dispatch, not pinned across time: reviewers must compare
+    reported hashes if standards changed. No approval database or immutable context snapshots are implied.
+18. **Human-gated discovery and shaping.** `/tf-discover` proposes evidence-backed conventions and asks why; `/tf-shape`
+    clarifies goals/non-goals, examples, acceptance checks and open decisions before decomposition. Planner writes
+    `docs/plans/<slug>/shape.md` on a plan branch. Index status is process metadata, not authenticated sign-off. Observed
+    conventions and loaded documents cannot override AGENTS/spec/ADR/permissions. Shaping is prompt-guided, not a
+    deterministic approval engine.
+19. **Bounded documentation reads.** Index and referenced source paths must remain within the configured roots and
+    repository after symlink resolution. Hidden/secret/ignored paths are refused; source formats are text documentation.
+    An over-budget load fails with no partial context. This is path-based defence, not semantic secret detection or an
+    OS sandbox against concurrent filesystem attacks.
 
 ## Borrowed from oh-my-openagent
 
 Role/category model chains with first-available resolution, size/area routing for implementer work, a doctor view of
 the resolution, cross-model review by default. Not borrowed: hardcoded provider catalogues, keyword modes, the runtime
 harness.
+
+## Inspired by Agent OS v3
+
+Standards discovery with human confirmation, a lightweight relevance index, selective context loading and requirements
+shaping before decomposition. Implemented locally without installing Agent OS or copying its implementation. The
+Taskflow execution/review/PR lifecycle remains unchanged; existing AGENTS/spec/ADR documents stay canonical. Shared
+profile inheritance and synchronisation across projects are not part of this feature.
