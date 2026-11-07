@@ -43,7 +43,17 @@ export class OpenSpec {
       changeName(change.changeName)
       const record = path.join(directory, `${change.changeName}.json`)
       const execution = fs.existsSync(record) ? readExecution(root, change.changeName) : null
-      return { ...change, adapterSchema: change.schemaName === "spec-driven" ? "requires selected inspect (unshadowed built-in only)" : "unsupported schema", execution: execution ? { phase: execution.phase, branch: execution.branch, worktree: execution.worktree, pr: execution.pr } : null }
+      let dispatchOwnership: { state: string; sessionID?: string; recovery?: string } | null = null
+      const lease = path.join(directory, `${change.changeName}.dispatch.lock`)
+      try {
+        const stat = fs.lstatSync(lease)
+        dispatchOwnership = { state: "unknown", recovery: "inspect persistent dispatch ownership; never break an unconfirmed child lease automatically" }
+        if (stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1 && stat.size <= 32_000) {
+          const data = JSON.parse(fs.readFileSync(lease, "utf8"))
+          dispatchOwnership = { state: data.state === "unknown" ? "unknown" : "held", ...(typeof data.sessionID === "string" ? { sessionID: data.sessionID } : {}), recovery: dispatchOwnership.recovery }
+        }
+      } catch (error) { if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") dispatchOwnership = { state: "unknown", recovery: "unreadable dispatch lease; human inspection required" } }
+      return { ...change, adapterSchema: change.schemaName === "spec-driven" ? "requires selected inspect (unshadowed built-in only)" : "unsupported schema", execution: execution ? { phase: execution.phase, branch: execution.branch, worktree: execution.worktree, pr: execution.pr, dispatchOwnership } : null }
     })
     return { version: OPENSPEC_VERSION, root, changes, diagnostics: this.diagnostics, notice: "Planning existence/checkmarks are not human approval, implementation verification or a merged PR. Selected validation/context/readiness require tf_openspec inspect; inventory is not execution authorization." }
   }

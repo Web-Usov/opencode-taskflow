@@ -15,7 +15,7 @@ export const TOOL_PERMISSION = { read: "taskflow.read", write: "taskflow.write",
 
 /** Process artifacts always require the planner/human gate, independent of project protected overrides. */
 export function protectedPaths(cfg: TaskflowConfig): string[] {
-  if (cfg.backend === "openspec") return [...cfg.protected, "openspec/**", ".taskflow/**", ".opencode/**", ".agents/**", ".claude/**", ".git/**"]
+  if (cfg.backend === "openspec") return [...cfg.protected, "openspec/**", ".taskflow/**", ".opencode/**", ".agents/**", ".claude/**", ".git", ".git/**", "opencode.json", "opencode.jsonc", "AGENTS.md", "CLAUDE.md"]
   // An index/guide at the namespace root must not accidentally protect the task directory or board.
   const directory = (file: string) => {
     const dir = path.posix.dirname(file)
@@ -92,7 +92,9 @@ export function roleRules(cfg: TaskflowConfig, role: Role, layout: RepoLayout): 
    */
   const everywhere = (glob: string) => {
     const w = toWildcard(glob)
-    return [w, `${mainDir}/${w}`]
+    // Native process metadata remains protected in newly claimed linked worktrees too. These conservative static
+    // patterns may match nested process files; the hard hook additionally binds the exact calling worktree.
+    return [w, `${mainDir}/${w}`, ...(cfg.backend === "openspec" ? [`${layout.worktreeParent}/*/${w}`] : [])]
   }
   const common: Rule[] = [
     ...FORCE_PUSH.map((r) => deny("shell", r)),

@@ -5,11 +5,18 @@ import { worktreeParent } from "./claim.ts"
 import { detectBaseBranch, git, hasRemote, mainCheckout, run, runShell, type RunOptions, type RunResult } from "./git.ts"
 import { OpenSpec, type Runner } from "./openspec.ts"
 import { changeName, digest, readExecution, recordDirectory, selectedRoot, validateExecution, writeExecution, type ExecutionRecord } from "./openspec-source.ts"
+import { UnknownChildState } from "./dispatch-ownership.ts"
 
 const opts = (signal?: AbortSignal): RunOptions => ({ signal, timeout: 120_000, maxOutputBytes: 256_000 })
 const cleanTree = (root: string) => git(["status", "--porcelain", "--untracked-files=all"], root) === ""
 const checkAbort = (signal?: AbortSignal) => { if (signal?.aborted) throw new Error("aborted") }
 const requireOK = (r: RunResult) => { if (!r.ok) throw new Error(r.stderr || r.stdout || "command failed") }
+
+/** Conservative capacity across reload: unknown/held leases cannot become invisible just because memory was reset. */
+export function dispatchLeaseCount(root: string): number {
+  try { return fs.readdirSync(recordDirectory(root)).filter((name) => /^[a-z][a-z0-9-]*\.dispatch\.lock$/.test(name)).length }
+  catch (error) { if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return 0; throw new Error("dispatch ownership inventory unavailable; inspect local execution records before dispatch") }
+}
 
 /** Persistent exclusive lock also serializes different plugin hosts/processes. Never break a stale lock automatically. */
 export async function executionLock<T>(root: string, change: string, fn: () => Promise<T>, kind: "execution" | "dispatch" = "execution"): Promise<T> {
@@ -20,12 +27,20 @@ export async function executionLock<T>(root: string, change: string, fn: () => P
   let fd: number
   try { fd = fs.openSync(lock, "wx", 0o600) } catch { throw new Error(`execution locked: ${lock}; inspect the owning operation before manually removing a stale lock`) }
   const owned = fs.fstatSync(fd)
+  let retain = false
   try {
     fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, change, started: new Date().toISOString() }) + "\n")
     return await fn()
+  } catch (error) {
+    if (kind === "dispatch" && error instanceof UnknownChildState) {
+      retain = true
+      try { fs.ftruncateSync(fd); fs.writeSync(fd, JSON.stringify({ pid: process.pid, change, sessionID: error.sessionID, state: "unknown", diagnostic: error.message.slice(0, 8192), recovery: "confirm child terminal/idle through host; then manually remove this exact lease and reload the plugin to clear the retained in-host slot", updated: new Date().toISOString() }), 0, "utf8") } catch { /* original ownership file must still remain */ }
+      throw new UnknownChildState(error.sessionID, `${error.message}; retained lease: ${lock}`)
+    }
+    throw error
   } finally {
     fs.closeSync(fd)
-    try { const current = fs.lstatSync(lock); if (current.dev === owned.dev && current.ino === owned.ino) fs.unlinkSync(lock) } catch { /* already removed; never remove a replacement */ }
+    if (!retain) try { const current = fs.lstatSync(lock); if (current.dev === owned.dev && current.ino === owned.ino) fs.unlinkSync(lock) } catch { /* already removed; never remove a replacement */ }
   }
 }
 

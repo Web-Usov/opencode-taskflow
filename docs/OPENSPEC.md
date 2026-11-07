@@ -61,6 +61,25 @@ are reported again. No model calls occur during diagnosis/readiness; dispatch ex
 The lifecycle tool is a write-permission tool; reviewer/qa use read-only status tools and supplied dispatch context.
 Implementer may associate its own PR only from its exact execution worktree; start/clean require lead or the human session.
 
+### Session moves and policy ownership
+
+Configuration precedence remains defaults → global Taskflow config → selected project Taskflow config → the host's plugin
+`ctx.options`. Options belong to the location where this plugin instance was set up; the plugin does **not** pretend that
+original options are newly discovered caller-specific options. Before every registered tool, direct command action and
+taskflow-role permission decision with a session, it resolves the actual session worktree and freshly loads its effective
+Taskflow config/sources with that same explicit options layer. A different backend, executable, verify/setup policy,
+invalid/unreadable config, different repository, unavailable host location, or differing host OpenCode configuration
+fails closed **before** mutation, native CLI/setup or prompt. Explicit directory targets are checked too.
+
+Same-policy worktree moves remain usable. Otherwise open/reload the plugin in the actual calling worktree; there is no
+silent backend/policy switch inside an old instance. Root and `.opencode` OpenCode config plus inherited ancestor/global
+host config are fingerprinted; changed host inputs require a location reload rather than guessed agent/plugin options.
+Native dispatch also checks execution-source and reviewer-directory policy before prompting. After reload, execution
+records/child bindings still refuse genuine config/source rebinding. Equal effective policy is not approval of changed
+planning content: source hashes impose their separate stronger constraint. The getter never falls back to setup location
+when session lookup fails. Legacy session-less permission-hook events retain their legacy static/hard checks; native
+events without a session fail closed, and legacy events with a session get the same caller-policy check.
+
 ## Commands and human gates
 
 `/tf-doctor`, `/tf-status`, `/tf-next`, `/tf-drive`, `/tf-ship`, `/tf-review`, `/tf-handoff`, `/tf-milestone`, `/tf-init` are mode-aware.
@@ -69,6 +88,10 @@ commands/skills are replaced. Start is not implicit on plugin load or an empty c
 Planner/human controls proposal/design/spec/config/schema. Implementer may edit only the **actual tracked checklist**
 inside the associated execution worktree while doing user-authorized implementation. No competing Markdown parser,
 automatic checkbox writer, stable positional-ID mapping or per-checkbox branch/task entity is introduced.
+Mandatory native edit protection includes the exact `.git` entry (a regular pointer file in linked worktrees), `.git/**`,
+root `opencode.json`/`opencode.jsonc`, `.opencode/**`, and root project instruction documents `AGENTS.md`/`CLAUDE.md`, as
+well as native planning/config/schema/state. These gates do not depend on configurable `protected` overrides. Static
+worktree-parent patterns conservatively cover process filenames at nested depths; the hard hook checks the actual caller.
 
 Upstream apply readiness does **not** require all planning artifacts. MissingPrerequisites are surfaced without adding
 a universal four-artifact gate; selected-change validation is separately mandatory. `all_done`/zero remaining do not
@@ -84,6 +107,17 @@ version/change/source commit/branch/worktree/PR/phase and source identities, **n
 Exclusive per-change lock files serialize multiple hosts; atomic record creation/replacement refuses unsafe existing paths.
 Dispatch holds a separate per-change lease (no concurrent agents on one change); cleanup acquires both lifecycle and
 dispatch locks, so it cannot remove a worktree still owned by a running child. Stale leases require human inspection.
+On prompt-transport error (which may have accepted work), wait error, cancellation or timeout, dispatch requests interruption
+then independently confirms idle through the SDK `session.wait` contract. That SDK method returns `Promise<void>`: a
+fulfilled void wait is terminal confirmation, not a missing state payload. A successful interrupt alone is **never** proof.
+Stop confirmation has a 5s total budget; missing/rejected/hanging/unexpected wait results or unresolved prompt acceptance
+preserve an `unknown` lease with child id and recovery instructions. The in-host running slot also remains occupied; status
+reports unknown ownership. Another child and cleanup stay blocked across plugin reload.
+Held/unknown leases conservatively consume implementer capacity even after reload (regardless of their role),
+so resetting in-memory counters cannot hide a potentially active child. Manual recovery requires the stop evidence below.
+No force-break/recovery command is
+provided: confirm the exact child has stopped in the host, manually inspect/remove that exact lease, then reload the plugin
+to clear its conservatively retained in-host slot. Never remove ownership merely because a transport request failed.
 This is deterministic preflight, not OS isolation against arbitrary concurrent filesystem attacks or an authenticated DB.
 The selected CLI executable is user-controlled trusted software; version/shape/fingerprint probes are compatibility
 checks, not cryptographic attestation of an installation or a defence against a malicious replacement executable.

@@ -27,6 +27,9 @@ ancestor roots и другие версии пока явно отклоняют
 В OpenSpec-режиме здесь **не создаются** tasks/epics/plans/standards/workflow. Локальные execution records без текста задач
 хранятся в `<git-common-dir>/.taskflow/openspec/`, не загрязняют source worktree и не являются журналом authenticated approval.
 При сбое setup worktree/ветка и любые пользовательские данные сохраняются; автоматического force-rollback нет.
+При ошибке связи с child освобождение lease возможно только после подтверждённого idle; неизвестное состояние сохраняет
+lease и блокирует новое исполнение/cleanup до ручной проверки. Если сессия переехала в worktree с другим/нечитаемым
+конфигом, инструмент остановится до действия и попросит открыть/reload плагин там — старая policy не применяется молча.
 
 Выбор режима: явный `backend:"openspec"|"standalone"` важнее discovery. `auto` сохраняет standalone для существующего
 Taskflow config/ownership signature; в остальных проектах ожидает OpenSpec, а не создаёт второй backlog.

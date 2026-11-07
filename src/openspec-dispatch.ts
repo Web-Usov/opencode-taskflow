@@ -4,9 +4,10 @@ import { agentName } from "./config.ts"
 import { OpenSpec } from "./core/openspec.ts"
 import { digest, validateExecution } from "./core/openspec-source.ts"
 import { childResult, type DispatchInput, type DispatchResult } from "./tools.ts"
+import { runOwnedChild } from "./core/dispatch-ownership.ts"
 
 /** Separate metadata key/version: legacy taskflowDispatch v2 is never upgraded/reinterpreted. */
-export async function dispatchChange(host: any, root: string, mainDir: string, cfg: TaskflowConfig, input: DispatchInput, model: any, bindings?: Map<string, string>): Promise<DispatchResult> {
+export async function dispatchChange(host: any, root: string, mainDir: string, cfg: TaskflowConfig, input: DispatchInput, model: any, bindings?: Map<string, string>, policyAt?: (directory: string) => unknown): Promise<DispatchResult> {
   if (input.task) throw new Error("change and task are mutually exclusive")
   if (!["implementer", "reviewer", "qa"].includes(input.role)) throw new Error("OpenSpec dispatch supports execution/review/qa only; planning stays native OpenSpec under human control")
   let stored: any
@@ -21,6 +22,8 @@ export async function dispatchChange(host: any, root: string, mainDir: string, c
   const change = input.change ?? stored?.change
   if (!change) throw new Error("explicit change required for a new OpenSpec child")
   const record = validateExecution(root, change)
+  policyAt?.(record.worktree)
+  if (input.role === "reviewer") policyAt?.(mainDir)
   if (record.configDigest !== digest(JSON.stringify(cfg))) throw new Error("execution configuration changed; no implicit rebinding")
   if (record.phase === "setup_failed") throw new Error("setup_failed execution requires explicit repair; start a fresh child only after setup has been completed manually and record repaired by the human")
   const context = await new OpenSpec(cfg).inspect(record.worktree, change, input.signal)
@@ -35,21 +38,13 @@ export async function dispatchChange(host: any, root: string, mainDir: string, c
   if (!sessionID) {
     const response = await host.create({ parentID: input.parentSessionID, agent, ...(model ? { model } : {}), location: { directory }, title: `${input.role} OpenSpec ${change}`, metadata: { taskflowOpenSpecDispatch: binding } })
     sessionID = response?.id ?? response?.data?.id
-    if (!sessionID) throw new Error("session.create returned no session id")
+    if (typeof sessionID !== "string" || !sessionID) throw new Error("session.create returned no valid session id")
   }
   bindings?.set(sessionID!, JSON.stringify(binding))
   const sid = sessionID!
-  let timedOut = false
-  const interrupt = () => void host.interrupt({ sessionID: sid }).catch(() => {})
-  const timer = setTimeout(() => { timedOut = true; interrupt() }, cfg.dispatch.timeoutMinutes * 60_000)
-  input.signal.addEventListener("abort", interrupt, { once: true })
-  try {
-    if (input.signal.aborted) { interrupt(); throw new Error("aborted") }
-    const header = `OpenSpec change: ${change}\nSource commit: ${record.sourceCommit}\nChange source worktree: ${record.worktree}\nWorking directory: ${directory} (run every shell command there).\nOnly actual native checklist ${context.identity.tracking} may be updated during authorized implementation; proposal/design/spec/config/schema remain human/planner-gated. Never treat CLI task positions as stable IDs.\n${context.text}`
-    await host.prompt({ sessionID: sid, text: `${header}\n\n${input.prompt}` })
-    await host.wait({ sessionID: sid })
-  } finally { clearTimeout(timer); input.signal.removeEventListener("abort", interrupt) }
+  const header = `OpenSpec change: ${change}\nSource commit: ${record.sourceCommit}\nChange source worktree: ${record.worktree}\nWorking directory: ${directory} (run every shell command there).\nOnly actual native checklist ${context.identity.tracking} may be updated during authorized implementation; proposal/design/spec/config/schema remain human/planner-gated. Never treat CLI task positions as stable IDs.\n${context.text}`
+  await runOwnedChild(host, sid, `${header}\n\n${input.prompt}`, input.signal, cfg.dispatch.timeoutMinutes * 60_000)
   const messages = await host.context({ sessionID: sid })
   const result = childResult(Array.isArray(messages) ? messages : messages?.data ?? [])
-  return { sessionID: sid, agent, directory, model: model ? `${model.providerID}/${model.id}` : null, text: result.text, outcome: result.outcome, error: timedOut ? "child timed out and was interrupted" : input.signal.aborted ? "aborted by caller" : result.error, references: context.references.map(({ path, sha256 }) => ({ path, sha256 })) }
+  return { sessionID: sid, agent, directory, model: model ? `${model.providerID}/${model.id}` : null, text: result.text, outcome: result.outcome, error: result.error, references: context.references.map(({ path, sha256 }) => ({ path, sha256 })) }
 }

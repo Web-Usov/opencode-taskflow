@@ -30,6 +30,18 @@ configuration, concrete reference paths and execution directory are bound and re
 Metadata is local association, never authenticated approval. Native planning files are protected; only the recorded
 tracked checklist in its exact execution worktree is writable by implementer. Shell analysis remains best effort.
 
+`src/core/dispatch-ownership.ts` gates lease release on authoritative idle confirmation. Post-prompt transport/wait errors,
+abort and timeout interrupt then call bounded SDK wait (Promise<void>). Unknown termination or outstanding prompt
+acceptance throws a typed ownership error: the persistent dispatch lease is annotated/retained, the in-host running count
+is not decremented, inventory reports unknown ownership, and cleanup/new children cannot overlap it. Recovery is manual.
+
+Setup-location policy is never silently mixed with moved caller files: registered tools/direct commands/permission hooks
+freshly compare caller effective config/sources and host config fingerprints before action. Same-policy moves are usable;
+different/unavailable/invalid caller policy requires opening/reloading the plugin there. Context options retain highest
+precedence; changed ancestor/global/project host inputs require reload, not inferred options. Native source/reviewer
+directories are checked too. Exact Git entry, root OpenCode config and root AGENTS/CLAUDE instruction documents join
+mandatory native protections regardless of configurable protected overrides.
+
 Mode is explicit backend config or read-only ownership discovery: existing Taskflow config/signatures retain standalone;
 all other projects expect OpenSpec and diagnose missing dependencies without scaffold. Registration never calls OpenSpec
 or scans repository trees. Taskflow commands keep the tf prefix and never replace native opsx commands/skills.
@@ -56,6 +68,7 @@ src/core/task-source.ts canonical task source association, directory identities,
 src/core/openspec.ts    bounded read-only native CLI adapter
 src/core/openspec-source.ts confined live change sources and local execution records
 src/core/openspec-execution.ts committed-source claim, setup, PR association and lossless merged cleanup
+src/core/dispatch-ownership.ts bounded child stop confirmation and retained unknown ownership
 src/openspec-dispatch.ts separate durable change child association and refreshed source context
 src/core/standards.ts  reference index, deterministic relevance, safe bounded source loading, task binding validation
 templates/             files tf_init copies into a project

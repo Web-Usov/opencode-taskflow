@@ -2,6 +2,10 @@
 
 ## 0.2.0 — unreleased
 
+- Review hardening: mandatory protection for linked-worktree `.git`, root OpenCode config and root AGENTS/CLAUDE;
+  post-prompt failure/abort/timeout confirms idle before releasing ownership, retaining unknown leases and active slots
+  otherwise. Caller-policy checks cover moved-session tools, direct commands, explicit targets and permission hooks;
+  different/invalid/unknown policy requires a location reload instead of stale setup/verify/backend behavior.
 - Product pivot: execution extension for existing OpenSpec, without a second planning backlog or mandatory Taskflow init.
   Tested published CLI 1.16.1, repo-local roots and unshadowed built-in spec-driven only. Native commands/skills/artifacts
   remain unchanged by registration/diagnosis/claim. Custom schemas/stores/other versions fail explicitly.

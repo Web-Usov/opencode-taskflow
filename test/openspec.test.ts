@@ -6,10 +6,11 @@ import { OpenSpec } from "../src/core/openspec.ts"
 import { cleanChange, recordChangePR, startChange } from "../src/core/openspec-execution.ts"
 import { changeIdentity, readExecution, recordDirectory, safePath, validateExecution, writeExecution } from "../src/core/openspec-source.ts"
 import { run } from "../src/core/git.ts"
-import { guard } from "../src/core/guard.ts"
+import { guard, roleRules } from "../src/core/guard.ts"
 import { commandSpecs } from "../src/commands.ts"
 import { rolePrompt } from "../src/roles.ts"
 import { dispatchChange } from "../src/openspec-dispatch.ts"
+import { runOwnedChild, UnknownChildState } from "../src/core/dispatch-ownership.ts"
 import { buildTools } from "../src/tools.ts"
 import { repoWithOrigin, sh, tmpdir, write } from "./helpers.ts"
 
@@ -53,6 +54,204 @@ function fixture() {
   const calls = () => fs.readFileSync(path.join(bin, "calls.jsonl"), "utf8").trim().split("\n").map((s) => JSON.parse(s))
   return { ...repo, cfg, settings, calls, bin, adapter: new OpenSpec(cfg), signal: new AbortController().signal }
 }
+
+async function bootPlugin(h: ReturnType<typeof fixture>, options: any = h.cfg, directory = h.main) {
+  const tools: any[] = [], commands: any[] = [], agents = new Map<string, any>(), hooks = new Map<string, any>()
+  const sessions = new Map<string, any>([["parent", { id: "parent", location: { directory } }]])
+  const prompts: any[] = [], creates: any[] = []
+  const host: any = {
+    get: async ({ sessionID }: any) => sessions.get(sessionID),
+    create: async (input: any) => { const child = { ...structuredClone(input), id: `child-${creates.length}` }; creates.push(child); sessions.set(child.id, child); return child },
+    prompt: async (input: any) => { prompts.push(input) }, wait: async () => {}, interrupt: async () => {}, context: async () => [],
+  }
+  const ctx: any = { location: { directory }, options, session: host,
+    agent: { transform: async (fn: any) => fn({ update: (name: string, update: any) => { const a = {}; update(a); agents.set(name, a) } }), reload: async () => {} },
+    command: { transform: async (fn: any) => fn({ add: (c: any) => commands.push(c) }), reload: async () => {} },
+    tool: { transform: async (fn: any) => fn({ namespace: () => {}, add: (t: any) => tools.push(t) }) },
+    permission: { hook: async (name: string, fn: any) => hooks.set(name, fn) }, model: { list: async () => [] },
+  }
+  const cleanup: any = await (await import("../src/index.ts")).default.setup(ctx)
+  const call = (name: string, input: any = {}, context: any = {}) => tools.find((t) => t.name === name).execute(input, { sessionID: "parent", agent: "lead", signal: h.signal, ...context })
+  return { tools, commands, agents, hooks, sessions, prompts, creates, host, ctx, cleanup, call }
+}
+
+describe("review regressions at registered plugin boundaries", () => {
+  test("mandatory exact Git/config/instruction entries are protected in a real linked worktree, relative and absolute", async () => {
+    const h = fixture(); h.cfg.protected = []
+    const r = await startChange(h.main, h.cfg, "demo", true, h.signal), p = await bootPlugin(h)
+    p.sessions.set("parent", { id: "parent", location: { directory: r.worktree } })
+    expect(fs.statSync(path.join(r.worktree, ".git")).isFile()).toBe(true)
+    const rules = roleRules(h.cfg, "implementer", { base: "main", mainDir: h.main, worktreeParent: h.cfg.git.worktreeDir })
+    const staticDenied = (file: string) => { let denied = false; for (const rule of rules) if (rule.action === "edit" && new RegExp("^" + rule.resource.split("*").map((s) => s.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$").test(file)) denied = rule.effect === "deny"; return denied }
+    try {
+      for (const relative of [".git", "opencode.json", "opencode.jsonc", "AGENTS.md", "CLAUDE.md", ".opencode/opencode.jsonc", "openspec/config.yaml", "openspec/changes/demo/.openspec.yaml"]) {
+        for (const resource of [relative, path.join(r.worktree, relative)]) {
+          expect(staticDenied(resource)).toBe(true)
+          const event = { agent: "implementer", sessionID: "parent", action: "edit", resources: [resource], effect: "allow" }
+          await p.hooks.get("evaluate")(event)
+          expect(event.effect).toBe("deny")
+        }
+      }
+      for (const resource of ["src/implementation.ts", "openspec/changes/demo/tasks.md", path.join(r.worktree, "openspec/changes/demo/tasks.md")]) {
+        expect(staticDenied(resource)).toBe(false)
+        const event = { agent: "implementer", sessionID: "parent", action: "edit", resources: [resource], effect: "allow" }
+        await p.hooks.get("evaluate")(event); expect(event.effect).toBe("allow")
+      }
+    } finally { p.cleanup() }
+  })
+
+  for (const failure of ["wait", "interrupt", "second-wait", "missing-wait", "bad-wait", "undefined-error", "prompt", "abort"] as const) test(`uncertain ${failure} retains dispatch ownership and active count until terminal confirmation`, async () => {
+    const h = fixture(); h.cfg.parallel = 1
+    await startChange(h.main, h.cfg, "demo", true, h.signal)
+    const p = await bootPlugin(h), controller = new AbortController()
+    let active = false, interrupts = 0, waits = 0
+    p.host.prompt = async () => { active = true; if (failure === "prompt") throw new Error("prompt transport uncertainty"); if (failure === "abort") controller.abort() }
+    p.host.wait = failure === "missing-wait" ? undefined : async () => { waits++; if (failure === "bad-wait") return null; if (failure === "undefined-error") throw undefined; throw new Error(waits === 1 ? "wait transport failure" : "stop wait failed") }
+    p.host.interrupt = async () => { interrupts++; if (failure === "interrupt") throw new Error("interrupt unavailable") }
+    try {
+      const result = await p.call("tf_dispatch", { role: "implementer", change: "demo", prompt: "work" }, { signal: controller.signal })
+      expect(result.content).toContain("ownership retained")
+      expect(active).toBe(true); expect(interrupts).toBeGreaterThan(0)
+      const lease = path.join(recordDirectory(h.main), "demo.dispatch.lock")
+      expect(fs.existsSync(lease)).toBe(true)
+      expect(JSON.parse(fs.readFileSync(lease, "utf8")).sessionID).toBe(p.creates[0].id)
+      expect((await p.call("tf_status")).content).toContain('"state": "unknown"')
+      expect((await p.call("tf_dispatch", { role: "reviewer", change: "demo", prompt: "must not overlap" })).content).toContain("locked")
+      expect((await p.call("tf_dispatch", { role: "implementer", change: "demo", prompt: "still active" })).content).toContain("already running")
+      await expect(cleanChange(h.main, h.cfg, "demo", true, h.signal)).rejects.toThrow("locked")
+      expect(p.creates).toHaveLength(1)
+      if (failure === "wait") {
+        const reloaded = await bootPlugin(h)
+        try {
+          expect((await reloaded.call("tf_dispatch", { role: "reviewer", change: "demo", prompt: "reload must not bypass lease" })).content).toContain("locked")
+          expect((await reloaded.call("tf_dispatch", { role: "implementer", change: "other", prompt: "reload must not undercount old child" })).content).toContain("already running")
+        } finally { reloaded.cleanup() }
+      }
+    } finally { p.cleanup() }
+  })
+
+  test("accepted prompt then wait rejection interrupts and CONFIRMS idle before releasing ownership", async () => {
+    const h = fixture(); await startChange(h.main, h.cfg, "demo", true, h.signal)
+    const p = await bootPlugin(h); let active = false, waits = 0, interrupts = 0
+    p.host.prompt = async () => { active = true }
+    p.host.wait = async () => { if (++waits === 1) throw new Error("temporary wait failure"); expect(interrupts).toBe(1); active = false }
+    p.host.interrupt = async () => { interrupts++ }
+    try {
+      const result = await p.call("tf_dispatch", { role: "implementer", change: "demo", prompt: "work" })
+      expect(result.content).toContain("stop confirmed")
+      expect(waits).toBe(2); expect(active).toBe(false)
+      expect(fs.existsSync(path.join(recordDirectory(h.main), "demo.dispatch.lock"))).toBe(false)
+      p.host.wait = async () => { active = false }
+      expect((await p.call("tf_dispatch", { role: "reviewer", change: "demo", prompt: "safe now" })).content).toContain("child session")
+    } finally { p.cleanup() }
+  })
+
+  test("prompt transport failure can recover only through stop confirmation; pending acceptance remains owned", async () => {
+    const h = fixture(); await startChange(h.main, h.cfg, "demo", true, h.signal)
+    const p = await bootPlugin(h); let interrupts = 0, waits = 0
+    p.host.prompt = async () => { throw new Error("prompt may have been accepted") }
+    p.host.interrupt = async () => { interrupts++ }
+    p.host.wait = async () => { waits++ }
+    try {
+      expect((await p.call("tf_dispatch", { role: "implementer", change: "demo", prompt: "work" })).content).toContain("stop confirmed")
+      expect(interrupts).toBe(1); expect(waits).toBe(1)
+      expect(fs.existsSync(path.join(recordDirectory(h.main), "demo.dispatch.lock"))).toBe(false)
+      const abort = new AbortController()
+      p.host.prompt = () => new Promise(() => { abort.abort() })
+      expect((await p.call("tf_dispatch", { role: "implementer", change: "demo", prompt: "uncertain pending prompt" }, { signal: abort.signal })).content).toContain("prompt acceptance remains unresolved")
+      expect(fs.existsSync(path.join(recordDirectory(h.main), "demo.dispatch.lock"))).toBe(true)
+      await expect(cleanChange(h.main, h.cfg, "demo", true, h.signal)).rejects.toThrow("locked")
+    } finally { p.cleanup() }
+  })
+
+  test("execution timeout stops and confirms; hanging stop RPC has a bounded unknown outcome", async () => {
+    let waits = 0, interrupts = 0
+    const host = { prompt: async () => {}, interrupt: async () => { interrupts++ }, wait: async () => { if (++waits === 1) await new Promise(() => {}) } }
+    await expect(runOwnedChild(host, "bounded-child", "work", new AbortController().signal, 10, 50)).rejects.toThrow("timed out; stop confirmed")
+    expect(waits).toBe(2); expect(interrupts).toBe(1)
+    const started = Date.now()
+    await expect(runOwnedChild({ prompt: async () => {}, interrupt: () => new Promise(() => {}), wait: async () => { throw new Error("transport failed") } }, "unknown-child", "work", new AbortController().signal, 100, 20)).rejects.toBeInstanceOf(UnknownChildState)
+    expect(Date.now() - started).toBeLessThan(1000)
+  })
+
+  test("moved same-repository callers cannot use stale backend/executable/verify/setup/config through tools, commands or permissions", async () => {
+    const h = fixture()
+    write(h.main, ".taskflow/config.jsonc", JSON.stringify(h.cfg))
+    sh("git", ["add", "-A"], h.main); sh("git", ["commit", "-qm", "execution policy"], h.main)
+    const p = await bootPlugin(h, null), other = path.join(h.dir, "moved")
+    sh("git", ["worktree", "add", "-qb", "moved", other, "HEAD"], h.main)
+    p.sessions.set("parent", { id: "parent", location: { directory: other } })
+    try {
+      // Identical effective policy remains usable without a forced location change.
+      expect((await p.call("tf_status")).content).toContain('"version": "1.16.1"')
+      for (const config of [{ backend: "standalone" }, { backend: "openspec", verify: { full: "other-verify" } }, { backend: "openspec", setup: { commands: ["touch MUST-NOT-RUN"] } }, { backend: "openspec", openspec: { executable: "/missing/other-openspec" } }, "{malformed"]) {
+        write(other, ".taskflow/config.jsonc", typeof config === "string" ? config : JSON.stringify({ ...h.cfg, ...config }))
+        const before = h.calls().length, prompts = p.prompts.length
+        for (const [tool, input] of [["tf_board", {}], ["tf_init", {}], ["tf_openspec", { operation: "start", change: "demo", confirm: true }], ["tf_dispatch", { role: "implementer", change: "demo", prompt: "forbidden" }]] as const) expect((await p.call(tool, input)).content).toContain("caller policy")
+        await expect(p.commands.find((c) => c.name === "tf-next").execute({ sessionID: "parent", prompt: { text: "demo" } })).rejects.toThrow("caller policy")
+        const event = { agent: "implementer", sessionID: "parent", action: "edit", resources: ["src/implementation.ts"], effect: "allow", message: "" }
+        await p.hooks.get("evaluate")(event); expect(event.effect).toBe("deny"); expect(event.message).toContain("caller policy")
+        expect(h.calls().length).toBe(before); expect(p.prompts.length).toBe(prompts); expect(p.creates).toHaveLength(0)
+        expect(fs.existsSync(path.join(other, "MUST-NOT-RUN"))).toBe(false)
+        expect(fs.existsSync(recordDirectory(h.main))).toBe(false)
+      }
+      write(other, ".taskflow/config.jsonc", JSON.stringify(h.cfg))
+      write(other, "opencode.jsonc", '{"plugins":[{"package":"opencode-taskflow","options":{"backend":"standalone"}}]}')
+      expect((await p.call("tf_init")).content).toContain("caller policy")
+      fs.unlinkSync(path.join(other, "opencode.jsonc"))
+      expect((await p.call("tf_status")).content).toContain('"version": "1.16.1"')
+      p.host.get = async () => undefined
+      expect((await p.call("tf_init")).content).toContain("caller policy unavailable")
+    } finally { p.cleanup() }
+  })
+
+  test("standalone-to-native movement refuses direct legacy claim/writes; reload uses the caller's native lifecycle policy", async () => {
+    const h = fixture(); h.cfg.backend = "standalone"
+    write(h.main, ".taskflow/config.jsonc", JSON.stringify(h.cfg)); sh("git", ["add", "-A"], h.main); sh("git", ["commit", "-qm", "standalone source policy"], h.main)
+    const other = path.join(h.dir, "native-caller")
+    sh("git", ["worktree", "add", "-qb", "native-caller", other, "HEAD"], h.main)
+    write(other, ".taskflow/config.jsonc", JSON.stringify({ ...h.cfg, backend: "openspec" }))
+    sh("git", ["add", "-A"], other); sh("git", ["commit", "-qm", "opt into native execution"], other)
+    const original = await bootPlugin(h, null)
+    original.sessions.set("parent", { id: "parent", location: { directory: other } })
+    try {
+      expect((await original.call("tf_board")).content).toContain("caller policy")
+      await expect(original.commands.find((c) => c.name === "tf-next").execute({ sessionID: "parent", prompt: { text: "T-001" } })).rejects.toThrow("caller policy")
+      expect(fs.existsSync(path.join(other, ".taskflow/tasks"))).toBe(false)
+      const reloaded = await bootPlugin(h, null, other)
+      try {
+        expect((await reloaded.call("tf_openspec", { operation: "start", change: "demo", confirm: true })).content).toContain('"phase": "claimed"')
+        expect(reloaded.agents.get("implementer").system).toContain("execution extension")
+        write(other, ".taskflow/config.jsonc", "{malformed")
+      } finally { reloaded.cleanup() }
+      const invalidReload = await bootPlugin(h, null, other)
+      try { expect((await invalidReload.call("tf_init")).content).toContain("caller policy"); expect(invalidReload.prompts).toHaveLength(0); expect(fs.existsSync(path.join(other, ".taskflow/tasks"))).toBe(false) } finally { invalidReload.cleanup() }
+    } finally { original.cleanup() }
+  })
+
+  test("reloaded policy changes cannot rebind an existing change child; explicit setup options retain highest precedence", async () => {
+    const h = fixture()
+    write(h.main, ".taskflow/config.jsonc", JSON.stringify(h.cfg)); sh("git", ["add", "-A"], h.main); sh("git", ["commit", "-qm", "execution policy"], h.main)
+    const p = await bootPlugin(h, null)
+    let sessionID: string
+    try {
+      expect((await p.call("tf_openspec", { operation: "start", change: "demo", confirm: true })).content).toContain('"phase": "claimed"')
+      const dispatched = await p.call("tf_dispatch", { role: "implementer", change: "demo", prompt: "initial work" })
+      sessionID = dispatched.content.match(/child session: (\S+)/)[1]
+    } finally { p.cleanup() }
+    write(h.main, ".taskflow/config.jsonc", JSON.stringify({ ...h.cfg, verify: { ...h.cfg.verify, full: "new-verify" } }))
+    const reload = await bootPlugin(h, null)
+    reload.sessions.set(sessionID!, p.sessions.get(sessionID!))
+    try {
+      const before = h.calls().length
+      const result = await reload.call("tf_dispatch", { role: "implementer", sessionID: sessionID!, prompt: "must not silently rebind" })
+      expect(result.content).toMatch(/caller policy|configuration changed/)
+      expect(reload.prompts).toHaveLength(0); expect(h.calls().length).toBe(before)
+    } finally { reload.cleanup() }
+    const override = await bootPlugin(h) // Explicit ctx.options is intentionally higher precedence than project config.
+    try { expect((await override.call("tf_models")).content).toContain('"full": null') } finally { override.cleanup() }
+  })
+})
 
 describe("OpenSpec read-only adapter", () => {
   test("exact named machine commands, bounded reads, readiness independent of missing planning prerequisites, no mutation", async () => {
