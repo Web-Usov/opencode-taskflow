@@ -50,7 +50,8 @@ describe("config", () => {
     expect(config.verify.full).toBe("make check")
     expect(config.review.maxRounds).toBe(7)
     expect(config.board.header[0]).toBe("# Task board (generated, do not edit)")
-    expect(sources.map((s) => s.ok)).toEqual([true, true])
+    expect(sources.filter((s) => s.path !== "(layout)").map((s) => s.ok)).toEqual([true, true])
+    expect(sources.find((s) => s.path === "(layout)")?.error).toContain("Legacy layout retained")
   })
   test("a broken project config is reported, defaults stay", () => {
     const root = tmpdir()

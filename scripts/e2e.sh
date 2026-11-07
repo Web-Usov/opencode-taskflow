@@ -23,10 +23,10 @@ cd "$APP"
 git checkout -q -b main
 echo '{"name":"app","scripts":{"test":"echo tests-ok","lint":"echo lint-ok"}}' > package.json
 echo "# App" > README.md
-mkdir -p .opencode
+mkdir -p .opencode .taskflow
 printf '{ "plugins": ["%s"] }\n' "$PLUGIN_DIR" > .opencode/opencode.jsonc
 LIVE_CHAIN="\"$LIVE_MODEL\""
-cat > .opencode/taskflow.jsonc <<EOF
+cat > .taskflow/config.jsonc <<EOF
 {
   "language": { "human": "en" },
   "verify": { "full": "npm test" },
@@ -60,6 +60,9 @@ echo "$agents" | python3 -c "
 import json,sys
 a=[x for x in json.load(sys.stdin)['data'] if x['id']=='implementer'][0]
 assert {'action':'edit','resource':'docs/spec/*','effect':'deny'} in a['permissions']
+for protected in ['.taskflow/config.jsonc', '.taskflow/epics/*', '.taskflow/standards/index.json', '.taskflow/plans/*', '.taskflow/workflow.md']:
+    assert {'action':'edit','resource':protected,'effect':'deny'} in a['permissions'], protected
+assert {'action':'edit','resource':'.taskflow/*','effect':'deny'} not in a['permissions']
 assert {'action':'shell','resource':'gh pr merge*','effect':'deny'} in a['permissions']
 " || fail "implementer permissions"
 ok "implementer permissions deny protected edits and merges"
@@ -86,11 +89,22 @@ run() { timeout 600 opencode run -m "$LIVE_MODEL" --auto "$@" 2>&1 | tail -40; }
 
 echo "--- live: tf_init + commit"
 run "Call the tool tf_init with language en. Then run: git add -A && git commit -m 'chore: taskflow scaffold' && git push origin main. Reply DONE when finished."
-[[ -f tasks/_template.md && -f docs/taskflow.md ]] || fail "tf_init did not scaffold"
+[[ -f .taskflow/templates/task.md && -f .taskflow/workflow.md ]] || fail "tf_init did not scaffold"
+[[ ! -e tasks && ! -e epics && ! -e docs && ! -e AGENTS.md && ! -e .github ]] || fail "tf_init created external artifacts"
 git log -1 --format=%s | grep -q scaffold || fail "scaffold not committed"
 ok "tf_init scaffolded and committed"
 
-cat > tasks/T-001-hello-file.md <<'EOF'
+# Explicit test milestone, not an epic invented by tf_init.
+cat > .taskflow/epics/E-01-smoke.md <<'EOF'
+---
+id: E-01
+title: Smoke test milestone
+status: planned
+accepted: null
+spec: []
+---
+EOF
+cat > .taskflow/tasks/T-001-hello-file.md <<'EOF'
 ---
 id: T-001
 title: Add hello file
@@ -128,8 +142,8 @@ EOF
 git add -A && git commit -qm "docs(tasks): add T-001" && git push -q origin main
 
 echo "--- live: guard denies protected edits for the implementer"
-run --agent implementer "Use your write tool to create the file epics/E-99-x.md with the content 'x'. Report exactly whether the tool call was allowed or rejected and the error text."
-[[ ! -f epics/E-99-x.md ]] || fail "implementer wrote a protected path"
+run --agent implementer "Use your write tool to create the file .taskflow/epics/E-99-x.md with the content 'x'. Report exactly whether the tool call was allowed or rejected and the error text."
+[[ ! -f .taskflow/epics/E-99-x.md ]] || fail "implementer wrote a protected path"
 ok "protected path stayed untouched"
 
 echo "--- live: tf_start + tf_dispatch implementer"
@@ -141,13 +155,13 @@ git -C "$WT" log -1 --format=%s | grep -q "T-001" || fail "implementer commit mi
 ok "worktree claimed and implementer committed in it"
 
 echo "--- live: implementer cannot dispatch, guard covers absolute worktree paths"
-run --agent implementer "1) Try to call the tool tf_dispatch with role reviewer and prompt 'x' and report the exact result. 2) Use your write tool to create the file $WT/epics/E-98-x.md (absolute path) with content 'x' and report whether it was allowed."
-[[ ! -f "$WT/epics/E-98-x.md" ]] || fail "implementer wrote a protected path inside the worktree"
+run --agent implementer "1) Try to call the tool tf_dispatch with role reviewer and prompt 'x' and report the exact result. 2) Use your write tool to create the file $WT/.taskflow/epics/E-98-x.md (absolute path) with content 'x' and report whether it was allowed."
+[[ ! -f "$WT/.taskflow/epics/E-98-x.md" ]] || fail "implementer wrote a protected path inside the worktree"
 ok "absolute protected path inside the worktree stayed untouched"
 
 echo "--- live: /tf-next T-002 runs the claim in code, switches to the implementer and moves the session"
-sed 's/T-001/T-002/g; s/hello-file/bye-file/; s/Add hello file/Add bye file/; s/hello.txt/bye.txt/g' tasks/T-001-hello-file.md > tasks/T-002-bye-file.md
-sed -i 's/^status: .*/status: todo/; s/^branch: .*/branch: null/' tasks/T-002-bye-file.md
+sed 's/T-001/T-002/g; s/hello-file/bye-file/; s/Add hello file/Add bye file/; s/hello.txt/bye.txt/g' .taskflow/tasks/T-001-hello-file.md > .taskflow/tasks/T-002-bye-file.md
+sed -i 's/^status: .*/status: todo/; s/^branch: .*/branch: null/' .taskflow/tasks/T-002-bye-file.md
 git add -A && git commit -qm "docs(tasks): add T-002" && git push -q origin main
 SID="$(opencode api post /api/session -d "{\"location\":{\"directory\":\"$APP\"},\"model\":{\"providerID\":\"${LIVE_MODEL%%/*}\",\"id\":\"${LIVE_MODEL#*/}\"}}" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("data",d)["id"])')"
 opencode api post "/api/session/$SID/command" -d '{"name":"tf-next","text":"T-002"}' >/dev/null

@@ -43,7 +43,7 @@ export interface TaskflowConfig {
     /** Worktree parent directory, relative to the main checkout. `{repo}` = checkout directory name. */
     worktreeDir: string
   }
-  paths: { tasks: string; epics: string; board: string; template: string }
+  paths: { config: string; tasks: string; epics: string; board: string; template: string; epicTemplate: string; workflow: string; plans: string; standardsGuide: string; prTemplate: string; humanReviewTemplate: string; milestones: string }
   task: { areas: string[]; sizes: string[]; idPadding: number }
   setup: { copy: Array<string | CopySpec>; commands: string[] }
   verify: { full: string | null; quick: string | null; e2e: string | null }
@@ -97,23 +97,25 @@ const BOARD_EN = {
   taskLine: "- [{id}]({file}) {title} — **{status}** · {area} · {size} · depends: {depends} · {pr}",
 }
 
-export function defaultConfig(humanLanguage = "ru"): TaskflowConfig {
+export function defaultConfig(humanLanguage = "ru", legacy = false): TaskflowConfig {
   return {
     language: { human: humanLanguage, agent: "en" },
     git: { remote: "origin", baseBranch: null, branchPrefix: "task/", worktreeDir: "../{repo}-wt" },
-    paths: { tasks: "tasks", epics: "epics", board: "tasks/README.md", template: "tasks/_template.md" },
+    paths: legacy
+      ? { config: ".opencode/taskflow.jsonc", tasks: "tasks", epics: "epics", board: "tasks/README.md", template: "tasks/_template.md", epicTemplate: "epics/_template.md", workflow: "docs/taskflow.md", plans: "docs/plans", standardsGuide: "docs/standards/README.md", prTemplate: "docs/taskflow-templates/pull-request.md", humanReviewTemplate: "docs/taskflow-templates/human-review.md", milestones: "docs/milestones" }
+      : { config: ".taskflow/config.jsonc", tasks: ".taskflow/tasks", epics: ".taskflow/epics", board: ".taskflow/tasks/README.md", template: ".taskflow/templates/task.md", epicTemplate: ".taskflow/templates/epic.md", workflow: ".taskflow/workflow.md", plans: ".taskflow/plans", standardsGuide: ".taskflow/standards/README.md", prTemplate: ".taskflow/templates/pull-request.md", humanReviewTemplate: ".taskflow/templates/human-review.md", milestones: ".taskflow/milestones" },
     task: { areas: ["api", "web", "mobile", "infra", "docs"], sizes: ["S", "M"], idPadding: 3 },
     setup: { copy: [], commands: [] },
     verify: { full: null, quick: null, e2e: null },
     ci: { checks: [] },
-    protected: ["docs/spec/**", "docs/decisions/**", "epics/**"],
+    protected: ["docs/spec/**", "docs/decisions/**", legacy ? "epics/**" : ".taskflow/epics/**"],
     qaPaths: ["e2e/**"],
     spec: null,
     board: humanLanguage === "ru" ? BOARD_RU : BOARD_EN,
     review: { maxRounds: 3, autoMerge: true, mergeMethod: "squash" },
     parallel: 2,
     dispatch: { timeoutMinutes: 180 },
-    standards: { index: "docs/standards/index.json", roots: ["docs", "AGENTS.md"], maxContextChars: 24_000 },
+    standards: { index: legacy ? "docs/standards/index.json" : ".taskflow/standards/index.json", roots: legacy ? ["docs", "AGENTS.md"] : [".taskflow", "docs", "AGENTS.md"], maxContextChars: 24_000 },
     agents: {
       // Chains are tried in order; models your providers do not serve are skipped.
       // Reviewer deliberately prefers a different model family than the implementer (cross-model review).
@@ -223,7 +225,21 @@ export function globalConfigPath(): string {
 }
 
 export function projectConfigPath(root: string): string {
-  return path.join(root, ".opencode", "taskflow.jsonc")
+  const central = path.join(root, ".taskflow/config.jsonc")
+  const old = path.join(root, ".opencode/taskflow.jsonc")
+  if (fs.existsSync(central)) return central
+  return fs.existsSync(old) || hasLegacyLayout(root) ? old : central
+}
+
+/** Directory names alone are not evidence of ownership. */
+function legacyLayoutSignature(root: string): [boolean, boolean, boolean, boolean] {
+  const read = (rel: string) => { try { return fs.readFileSync(path.join(root, rel), "utf8") } catch { return "" } }
+  return [/opencode-taskflow/.test(read("docs/taskflow.md")), /scripts\/tasks\.mjs/.test(read("tasks/README.md")), fs.existsSync(path.join(root, "scripts/tasks.mjs")), fs.existsSync(path.join(root, "tasks/_template.md"))]
+}
+
+export function hasLegacyLayout(root: string): boolean {
+  const [workflow, board, script, template] = legacyLayoutSignature(root)
+  return workflow || (board && script && template)
 }
 
 function readLayer(file: string, sources: ConfigSource[]): unknown {
@@ -239,19 +255,31 @@ function readLayer(file: string, sources: ConfigSource[]): unknown {
 }
 
 /**
- * defaults <- ~/.config/opencode/taskflow.jsonc <- <root>/.opencode/taskflow.jsonc <- plugin options.
+ * defaults <- global config <- selected project config (.taskflow first, legacy fallback) <- plugin options.
  * The language of the defaults follows the last (highest-precedence) layer that sets `language.human`, so board texts
  * match it. Invalid values are replaced by their defaults field by field and reported as a `validation` source.
  */
 export function loadConfig(root: string, options: unknown = undefined, globalPath = globalConfigPath()): LoadedConfig {
   const sources: ConfigSource[] = []
-  const layers = [readLayer(globalPath, sources), readLayer(projectConfigPath(root), sources), options]
+  const selected = projectConfigPath(root)
+  const layers = [readLayer(globalPath, sources), readLayer(selected, sources), options]
+  const explicitLegacy = layers.some((l) => isPlainObject(l) && isPlainObject(l.paths) && l.paths.tasks === "tasks" && (l.paths.epics === "epics" || l.paths.template === "tasks/_template.md"))
+  const legacy = selected.endsWith("/.opencode/taskflow.jsonc") || (!fs.existsSync(selected) && (hasLegacyLayout(root) || explicitLegacy))
+  if (fs.existsSync(path.join(root, ".taskflow/config.jsonc")) && fs.existsSync(path.join(root, ".opencode/taskflow.jsonc"))) sources.push({ path: path.join(root, ".opencode/taskflow.jsonc"), ok: true, error: "ignored: .taskflow/config.jsonc takes precedence; legacy project layer is not merged" })
+  if (legacy) sources.push({ path: "(layout)", ok: true, error: "Legacy layout retained. No files moved. Migration requires a separately approved path inventory and move plan." })
   let human = "ru"
   for (const l of layers) {
     const lang = isPlainObject(l) && isPlainObject(l.language) ? l.language.human : undefined
     if (typeof lang === "string") human = lang
   }
-  const defaults = defaultConfig(human)
+  const defaults = defaultConfig(human, legacy)
+  // Upgrade compatibility is read-only: prefer existing customized legacy checklists without requiring init.
+  // Applying this to defaults BEFORE layers ensures every explicit global/project/options override still wins.
+  if (legacy) {
+    const existing = (rel: string) => { try { return fs.statSync(path.join(root, rel)).isFile() } catch { return false } }
+    if (existing(".github/pull_request_template.md")) defaults.paths.prTemplate = ".github/pull_request_template.md"
+    if (existing(".github/PULL_REQUEST_TEMPLATE/human-review.md")) defaults.paths.humanReviewTemplate = ".github/PULL_REQUEST_TEMPLATE/human-review.md"
+  }
   let config = defaults
   for (const l of layers) {
     config = deepMerge(config, l)
@@ -266,6 +294,8 @@ export function loadConfig(root: string, options: unknown = undefined, globalPat
     }
   }
   const problems = validate(config, defaults)
+  // Discovery, not an inherited global path, determines the project config destination.
+  config.paths.config = fs.existsSync(selected) ? path.relative(root, selected).split(path.sep).join("/") : defaults.paths.config
   if (problems.length) sources.push({ path: "(validation)", ok: false, error: problems.join("; ") })
   return { config, sources }
 }
@@ -290,7 +320,7 @@ const isModelList: Check = (v) => v === undefined || isStrArray(v)
 const SCHEMA: Array<[string, Check]> = [
   ["language.human", isStr], ["language.agent", isStr],
   ["git.remote", isNonEmpty], ["git.baseBranch", (v) => v === null || isNonEmpty(v)], ["git.branchPrefix", isNonEmpty], ["git.worktreeDir", isNonEmpty],
-  ["paths.tasks", isNonEmpty], ["paths.epics", isNonEmpty], ["paths.board", isNonEmpty], ["paths.template", isNonEmpty],
+  ...["config", "tasks", "epics", "board", "template", "epicTemplate", "workflow", "plans", "standardsGuide", "prTemplate", "humanReviewTemplate", "milestones"].map((k): [string, Check] => [`paths.${k}`, isNonEmpty]),
   ["task.areas", isStrArray], ["task.sizes", isStrArray], ["task.idPadding", (v) => isPosInt(v) && (v as number) <= 9],
   ["setup.copy", isCopyList], ["setup.commands", isStrArray],
   ["verify.full", isStrOrNull], ["verify.quick", isStrOrNull], ["verify.e2e", isStrOrNull],
@@ -374,7 +404,8 @@ export const taskIdRe = (cfg: TaskflowConfig) => new RegExp(`^T-\\d{${cfg.task.i
 
 /** mtime fingerprint of the config files, to re-read them only when they change. */
 export function configStamp(root: string, globalPath = globalConfigPath()): string {
-  return [globalPath, projectConfigPath(root)]
+  const candidates = [path.join(root, ".taskflow/config.jsonc"), path.join(root, ".opencode/taskflow.jsonc")]
+  const files = [globalPath, ...candidates]
     .map((f) => {
       try {
         return String(fs.statSync(f).mtimeMs)
@@ -383,6 +414,11 @@ export function configStamp(root: string, globalPath = globalConfigPath()): stri
       }
     })
     .join("|")
+  // Discovery and invalidation use exactly the same ownership predicates, even for same-mtime content changes.
+  const templates = [".github/pull_request_template.md", ".github/PULL_REQUEST_TEMPLATE/human-review.md"].map((rel) => {
+    try { return fs.statSync(path.join(root, rel)).isFile() } catch { return false }
+  })
+  return files + "|" + (candidates.some((f) => fs.existsSync(f)) ? "configured" : JSON.stringify(legacyLayoutSignature(root))) + "|" + JSON.stringify(templates)
 }
 
 export function agentName(config: TaskflowConfig, role: Role): string {

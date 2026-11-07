@@ -17,6 +17,8 @@ src/core/claim.ts      claim (worktree), new-task ids, clean (port of task-start
 src/core/models.ts     model chains and routing
 src/core/guard.ts      per-role permission rules and the hard guard
 src/core/init.ts       project detection and scaffolding
+src/core/scaffold.ts   full-write-set preflight: portable paths, existing symlink/type confinement, collisions
+src/core/task-source.ts canonical task source association, directory identities, regular-file policy
 src/core/standards.ts  reference index, deterministic relevance, safe bounded source loading, task binding validation
 templates/             files tf_init copies into a project
 test/                  bun tests (unit + real git repos + parity with finance)
@@ -74,17 +76,42 @@ scripts/e2e.sh         loads the plugin into the running OpenCode service and as
     reported hashes if standards changed. No approval database or immutable context snapshots are implied.
 18. **Human-gated discovery and shaping.** `/tf-discover` proposes evidence-backed conventions and asks why; `/tf-shape`
     clarifies goals/non-goals, examples, acceptance checks and open decisions before decomposition. Planner writes
-    `docs/plans/<slug>/shape.md` on a plan branch. Index status is process metadata, not authenticated sign-off. Observed
+    `<paths.plans>/<slug>/shape.md` on a plan branch. Index status is process metadata, not authenticated sign-off. Observed
     conventions and loaded documents cannot override AGENTS/spec/ADR/permissions. Shaping is prompt-guided, not a
     deterministic approval engine.
 19. **Bounded documentation reads.** Index and referenced source paths must remain within the configured roots and
     repository after symlink resolution. Hidden/secret/ignored paths are refused; source formats are text documentation.
     An over-budget load fails with no partial context. This is path-based defence, not semantic secret detection or an
     OS sandbox against concurrent filesystem attacks.
-20. **Continuation revalidation.** Child session metadata stores its task/role/parent/directory association, not source
-    snapshots. A continuation recovers that association and reloads/revalidates the binding even when `task` is omitted.
-    Conflicting identities or unrecoverable legacy children fail closed before prompting. Session metadata round-trip
-    support was checked against OpenCode 2.2.6 without model calls.
+20. **Continuation revalidation.** V2 child metadata stores task/role/parent/execution-directory association AND a
+    separate canonical source association: repository common dir, source worktree root (canonical and selected spelling),
+    selected tasks path, root/repository/directory filesystem identities and exact task file path. Continuation recomputes
+    and compares it before prompting, including after plugin reload and when `task` is omitted. Task directory/file
+    symlink aliases, changed roots, replacement directories and renamed task files fail closed. File content/inode is
+    not snapshotted: atomic editor replacement at the same path and ordinary standards refresh remain valid. Reviewer
+    execution stays in main while the source association points to the task worktree. Old v1 metadata is unrecoverable
+    and requires a new child. Metadata round-trip API support was previously checked on OpenCode 2.2.6 without model
+    calls; the new nested v2 association is covered by fake-host/reload tests, not a new live API claim.
+21. **Centralized, tracked process namespace.** New projects use `.taskflow/config.jsonc`, workflow, tasks/epics,
+    plans, standards and templates under `.taskflow/`. `paths` renders all runtime process locations; no product
+    specifications are copied or moved. Init has no live example epic and no external AGENTS/GitHub writes unless
+    explicitly opted in. Standards allow the `.taskflow` hidden segment only at the top level under configured roots;
+    hidden children and secret/dependency/Git paths remain forbidden, before and after symlink resolution.
+22. **Compatibility without migration.** Central project config wins over the legacy `.opencode/taskflow.jsonc`
+    (the latter is ignored, not merged). Both discovery candidates and the global file participate in the config
+    stamp. Legacy config, a workflow ownership marker, or a strong finance board/script/template signature retain
+    legacy defaults. Explicit global legacy path pairs also retain them. Bare tasks/epics directories are not ownership
+    evidence. Init persists effective settings, using the same detected verify commands in config and workflow.
+    Moving existing project files requires a separately approved inventory and plan; no migration runs on load/init.
+    Process config, epic/template files, workflow, standards and plans are planner/human-gated independently of
+    `protected` overrides; the task directory and generated board remain writable by implementers. Shell remains best effort.
+23. **Scaffold preflight is deterministic filesystem safety.** All destinations (including config, board and opt-in
+    integrations) are validated before the first write. Portable relative spellings, every existing symlink ancestor,
+    destination types, canonical/hardlink collisions and file-as-parent conflicts are checked as one write set. Existing
+    compatible files, including a board, are retained by init; explicit tf_board regenerates the latter. This does not
+    claim concurrent-race isolation. Ownership-signature predicates are shared by config discovery and cache stamps
+    when no project config exists. Legacy template defaults select existing GitHub checklists read-only, with explicit
+    config overrides taking precedence; template existence changes also invalidate the config cache.
 
 ## Borrowed from oh-my-openagent
 

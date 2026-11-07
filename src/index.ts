@@ -14,12 +14,12 @@ import type { Plugin } from "@opencode/plugin"
 import { agentChain, agentName, configStamp, loadConfig, ROLES, type LoadedConfig, type Role, type TaskflowConfig } from "./config.ts"
 import { commandSpecs } from "./commands.ts"
 import { claim, worktreeParent } from "./core/claim.ts"
-import { asString } from "./core/frontmatter.ts"
 import { detectBaseBranch, mainCheckout, worktreePaths, worktreeRoot } from "./core/git.ts"
 import { guard, roleRules, type RepoLayout } from "./core/guard.ts"
 import { resolveChain, type AvailableModel } from "./core/models.ts"
-import { info, loadTasks } from "./core/tasks.ts"
+import { info } from "./core/tasks.ts"
 import { taskStandards, type StandardsContext } from "./core/standards.ts"
+import { isTaskSourceIdentity, readTaskSource, type TaskSourceIdentity } from "./core/task-source.ts"
 import { ROLE_DESCRIPTIONS, roleMode, rolePrompt } from "./roles.ts"
 import { buildTools, childResult, dispatchChain, taskWorktree, type DispatchInput, type DispatchResult } from "./tools.ts"
 
@@ -33,16 +33,20 @@ const modelRef = (m: { providerID: string; id: string; variant?: string }) => ({
 const modelString = (m: { providerID: string; id: string; variant?: string } | null) => (m ? `${m.providerID}/${m.id}${m.variant ? `#${m.variant}` : ""}` : null)
 
 interface DispatchBinding {
-  version: 1
+  version: 2
   role: Role
   agent: string
   task: string | null
   parentSessionID: string
   directory: string
+  taskSource: TaskSourceIdentity | null
 }
 function dispatchBinding(value: any): DispatchBinding | null {
-  if (!value || value.version !== 1 || !ROLES.includes(value.role) || value.role === "lead" || typeof value.agent !== "string" || !value.agent || !(value.task === null || (typeof value.task === "string" && value.task !== "")) || typeof value.parentSessionID !== "string" || !value.parentSessionID || typeof value.directory !== "string" || !path.isAbsolute(value.directory)) return null
-  return { version: 1, role: value.role, agent: value.agent, task: value.task, parentSessionID: value.parentSessionID, directory: value.directory }
+  if (!value || value.version !== 2 || !ROLES.includes(value.role) || value.role === "lead" || typeof value.agent !== "string" || !value.agent || !(value.task === null || (typeof value.task === "string" && value.task !== "")) || typeof value.parentSessionID !== "string" || !value.parentSessionID || typeof value.directory !== "string" || !path.isAbsolute(value.directory) || (value.task === null ? value.taskSource !== null : !isTaskSourceIdentity(value.taskSource))) return null
+  // Normalize property order and detach host-returned nested values from the in-memory association cache.
+  const s = value.taskSource as TaskSourceIdentity | null
+  const taskSource = s ? { root: s.root, rootPath: s.rootPath, rootId: s.rootId, repository: s.repository, repositoryId: s.repositoryId, tasks: s.tasks, directoryIds: [...s.directoryIds], file: s.file } : null
+  return { version: 2, role: value.role, agent: value.agent, task: value.task, parentSessionID: value.parentSessionID, directory: value.directory, taskSource }
 }
 
 export default define({
@@ -212,6 +216,7 @@ export default define({
       const agent = agentName(cfg, input.role)
       let taskID = input.task
       let boundDirectory: string | undefined
+      let boundSource: TaskSourceIdentity | null = null
       if (input.sessionID) {
         const response: any = await ctx.session.get({ sessionID: input.sessionID as any })
         const child = response?.data ?? response
@@ -229,16 +234,19 @@ export default define({
         if (child.location?.directory !== binding.directory || (input.directory !== undefined && path.resolve(mainDir, input.directory) !== binding.directory)) throw new Error("child working directory does not match its dispatch association")
         taskID = binding.task ?? undefined
         boundDirectory = binding.directory
+        boundSource = binding.taskSource
         children.set(input.sessionID, binding)
       }
       let task: { size?: string; area?: string } | null = null
       let standards: StandardsContext = taskStandards(root, cfg, undefined)
       const wt = taskID ? taskWorktree(root, cfg, taskID) : null
+      let taskSource: TaskSourceIdentity | null = null
       if (taskID) {
-        const doc = loadTasks(wt ?? root, cfg).find((d) => asString(d.data?.id) === taskID)
-        if (!doc?.data) throw new Error(`task ${taskID} not found or missing frontmatter in ${wt ?? root}`)
+        const { doc, source } = readTaskSource(wt ?? root, cfg, taskID)
+        if (input.sessionID && JSON.stringify(boundSource) !== JSON.stringify(source)) throw new Error("child task source identity changed (repository/worktree, task directory or file); start a new child session")
+        taskSource = source
         task = info(doc)
-        standards = taskStandards(wt ?? root, cfg, doc.data.standards)
+        standards = taskStandards(source.root, cfg, doc.data!.standards)
       }
       // the reviewer reads the PR through git and never works inside the implementer's worktree
       const directory = boundDirectory ?? (input.directory ? path.resolve(mainDir, input.directory) : input.role === "reviewer" ? mainDir : (wt ?? mainDir))
@@ -252,14 +260,14 @@ export default define({
       try {
         let sessionID = input.sessionID
         if (!sessionID) {
-          const binding: DispatchBinding = { version: 1, role: input.role, agent, task: taskID ?? null, parentSessionID: input.parentSessionID, directory }
+          const binding: DispatchBinding = { version: 2, role: input.role, agent, task: taskID ?? null, parentSessionID: input.parentSessionID, directory, taskSource }
           const s: any = await ctx.session.create({
             parentID: input.parentSessionID as any,
             agent: agent as any,
             ...(model ? { model: modelRef(model) as any } : {}),
             location: { directory } as any,
             title: `${input.role}${taskID ? ` ${taskID}` : ""}${category ? ` [${category}]` : ""}`,
-            metadata: { taskflowDispatch: { ...binding } },
+            metadata: { taskflowDispatch: { ...binding, taskSource: binding.taskSource ? { ...binding.taskSource, directoryIds: [...binding.taskSource.directoryIds] } : null } },
           })
           const id = s?.id ?? s?.data?.id
           if (typeof id !== "string" || !id) throw new Error("session.create returned no session id")
@@ -271,7 +279,7 @@ export default define({
           await ctx.session.interrupt({ sessionID: sid as any } as any).catch(() => {})
           throw new Error("aborted")
         }
-        const header = [taskID ? `Task: ${taskID}` : "", `Working directory: ${directory} (run every shell command there).`, `Standards binding source: ${wt ?? root}`, standards.text].filter(Boolean).join("\n")
+        const header = [taskID ? `Task: ${taskID}` : "", taskSource ? `Task source file: ${taskSource.file}` : "", `Working directory: ${directory} (run every shell command there).`, `Standards binding source: ${taskSource?.root ?? root}`, standards.text].filter(Boolean).join("\n")
         let timedOut = false
         const interrupt = () => void ctx.session.interrupt({ sessionID: sid as any } as any).catch(() => {})
         input.signal.addEventListener("abort", interrupt, { once: true })

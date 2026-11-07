@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import fs from "node:fs"
 import path from "node:path"
-import { loadConfig } from "../src/config.ts"
+import { defaultConfig, loadConfig } from "../src/config.ts"
 import { detect, init } from "../src/core/init.ts"
 import { check, renderBoard } from "../src/core/tasks.ts"
 import { cfg, repoWithOrigin, tmpdir, write } from "./helpers.ts"
@@ -50,22 +50,23 @@ describe("init", () => {
     })
     const d = detect(main)
     expect(d).toMatchObject({ packageManager: "pnpm", verify: { full: "pnpm verify", quick: "pnpm verify:quick", e2e: "pnpm e2e:smoke" }, baseBranch: "main" })
-    const r = init(main, cfg(), { base: "main", mainDir: main, worktreeParent: main + "-wt" }, { human: "ru" })
-    expect(r.created).toContain(".opencode/taskflow.jsonc")
-    expect(r.created).toContain("tasks/_template.md")
-    expect(r.created).toContain("epics/E-01-example.md")
-    expect(r.created).toContain("AGENTS.md (workflow section appended)")
-    expect(r.skipped).toContain(".github/pull_request_template.md")
+    const r = init(main, defaultConfig(), { base: "main", mainDir: main, worktreeParent: main + "-wt" }, { human: "ru" })
+    expect(r.created).toContain(".taskflow/config.jsonc")
+    expect(r.created).toContain(".taskflow/templates/task.md")
+    expect(r.created).toContain(".taskflow/templates/epic.md")
+    expect(r.created.every((f) => f.startsWith(".taskflow/"))).toBe(true)
+    expect(fs.readFileSync(path.join(main, "AGENTS.md"), "utf8")).toBe("# Guide\n")
     expect(fs.readFileSync(path.join(main, ".github/pull_request_template.md"), "utf8")).toBe("mine")
-    expect(fs.readFileSync(path.join(main, ".github/PULL_REQUEST_TEMPLATE/human-review.md"), "utf8")).toContain("Требуется ревью человека")
-    const project = fs.readFileSync(path.join(main, ".opencode/taskflow.jsonc"), "utf8")
-    expect(project).toContain('"full": "pnpm verify"')
-    expect(project).toContain('"commands": ["pnpm install --frozen-lockfile --prefer-offline"]')
+    expect(fs.readFileSync(path.join(main, ".taskflow/templates/human-review.md"), "utf8")).toContain("Требуется ревью человека")
+    const project = loadConfig(main, undefined, "/nonexistent").config
+    expect(project.verify.full).toBe("pnpm verify")
+    expect(project.setup.commands).toEqual(["pnpm install --frozen-lockfile --prefer-offline"])
+    expect(fs.readFileSync(path.join(main, project.paths.workflow), "utf8")).toContain("`pnpm verify`")
     // the scaffold itself is a valid task system
     const loaded = loadConfig(main, undefined, "/nonexistent").config
     expect(check(main, loaded).errors).toEqual([])
     // second run changes nothing
-    expect(init(main, cfg(), { base: "main", mainDir: main, worktreeParent: main + "-wt" }).created).toEqual([])
+    expect(init(main, loaded, { base: "main", mainDir: main, worktreeParent: main + "-wt" }).created).toEqual([])
   })
 
   test("detects non-JS projects", () => {

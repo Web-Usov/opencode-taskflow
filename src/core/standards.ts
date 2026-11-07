@@ -29,10 +29,10 @@ const documentationPath = (rel: string) => {
 }
 
 /** Strict portable repo-relative paths. No URLs, traversal, hidden credentials or dependency internals. */
-export function validateStandardPath(value: string): void {
+export function validateStandardPath(value: string, namespace = false): void {
   if (!value || /[\\:\x00-\x1f\x7f]/.test(value) || path.posix.isAbsolute(value)) throw new Error(`unsafe standards path: ${value}`)
   const parts = value.split("/")
-  if (parts.some((p) => !p || p === "." || p === ".." || p.startsWith(".") || /^(node_modules|secrets?|credentials?)([._-]|$)/i.test(p) || /\.(pem|key|p12|pfx)$/i.test(p))) {
+  if (parts.some((p, i) => !p || p === "." || p === ".." || (p.startsWith(".") && !(namespace && i === 0 && p === ".taskflow")) || /^(node_modules|secrets?|credentials?)([._-]|$)/i.test(p) || /\.(pem|key|p12|pfx)$/i.test(p))) {
     throw new Error(`unsafe standards path: ${value}`)
   }
 }
@@ -40,9 +40,10 @@ const under = (file: string, root: string) => file === root || file.startsWith(r
 
 /** Check both spelling and resolved target, including symlinks in any parent directory. */
 export function standardFile(root: string, rel: string, cfg: TaskflowConfig, source = false): string {
-  validateStandardPath(rel)
+  const namespace = cfg.standards.roots.some((r) => r === ".taskflow" || r.startsWith(".taskflow/"))
+  validateStandardPath(rel, namespace)
   if (source) documentationPath(rel)
-  for (const allowed of cfg.standards.roots) validateStandardPath(allowed)
+  for (const allowed of cfg.standards.roots) validateStandardPath(allowed, namespace)
   if (!cfg.standards.roots.some((r) => under(rel, r))) throw new Error(`standards path outside allowed roots: ${rel}`)
   const repo = fs.realpathSync(root)
   const file = path.join(repo, rel)
@@ -59,7 +60,7 @@ export function standardFile(root: string, rel: string, cfg: TaskflowConfig, sou
   if (source && ancestor === file) documentationPath(real)
   const resolved = path.relative(repo, real).split(path.sep).join("/")
   if (resolved) {
-    validateStandardPath(resolved)
+    validateStandardPath(resolved, namespace)
     if (!cfg.standards.roots.some((r) => under(resolved, r))) throw new Error(`resolved standards path outside allowed roots: ${rel}`)
   }
   if (tryGit(["check-ignore", "--no-index", "--", rel], repo) || (resolved && tryGit(["check-ignore", "--no-index", "--", resolved], repo))) throw new Error(`ignored standards path is not readable: ${rel}`)
@@ -81,7 +82,7 @@ function readText(root: string, rel: string, cfg: TaskflowConfig, limit: number,
   return text
 }
 
-export function validateStandardsIndex(value: unknown): StandardsIndex {
+export function validateStandardsIndex(value: unknown, namespace = false): StandardsIndex {
   if (!object(value) || value.version !== 1 || !Array.isArray(value.entries)) throw new Error("standards index requires version: 1 and entries: []")
   const ids = new Set<string>()
   const entries = value.entries.map((e: unknown): StandardEntry => {
@@ -90,7 +91,7 @@ export function validateStandardsIndex(value: unknown): StandardsIndex {
     }
     if (ids.has(e.id)) throw new Error(`duplicate standards id: ${e.id}`)
     ids.add(e.id)
-    validateStandardPath(e.path)
+    validateStandardPath(e.path, namespace)
     documentationPath(e.path)
     if (e.description !== undefined && typeof e.description !== "string") throw new Error(`invalid description: ${e.id}`)
     for (const k of ["areas", "tags"]) if (e[k] !== undefined && !strings(e[k])) throw new Error(`invalid ${k}: ${e.id}`)
@@ -105,7 +106,7 @@ export function readStandardsIndex(root: string, cfg: TaskflowConfig): Standards
   let value: unknown
   try { value = JSON.parse(readText(root, cfg.standards.index, cfg, 1_000_000)) }
   catch (e) { throw new Error(`cannot read standards index ${cfg.standards.index}: ${(e as Error).message}`) }
-  const index = validateStandardsIndex(value)
+  const index = validateStandardsIndex(value, cfg.standards.roots.some((r) => r === ".taskflow" || r.startsWith(".taskflow/")))
   // Reject an unsafe entry anywhere in the index before returning any selected contents.
   for (const e of index.entries) standardFile(root, e.path, cfg, true)
   return index
