@@ -262,7 +262,7 @@ describe("tool, process and scaffold boundaries", () => {
     const root = tmpdir()
     const globalFile = path.join(tmpdir(), "global-taskflow.jsonc")
     const standards = { index: "policy/index.json", roots: ["policy"], maxContextChars: 12000 }
-    fs.writeFileSync(globalFile, JSON.stringify({ language: { human }, standards }))
+    fs.writeFileSync(globalFile, JSON.stringify({ backend: "standalone", language: { human }, standards }))
     const before = loadConfig(root, undefined, globalFile).config
     init(root, before, { ...layout, mainDir: root })
     const after = loadConfig(root, undefined, globalFile).config

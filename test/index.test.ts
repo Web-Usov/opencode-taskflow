@@ -300,6 +300,8 @@ describe("running host discovers ownership signature changes", () => {
     }
     if (remove) add()
     const f = fakeCtx(repo.main)
+    // This fixture tests standalone layout cache invalidation, not fresh-project backend discovery.
+    f.ctx.options = { backend: "standalone" }
     const cleanup: any = await (await import("../src/index.ts")).default.setup(f.ctx)
     f.replay()
     try {
@@ -497,10 +499,10 @@ describe("plugin entry with a fake OpenCode context", () => {
     expect(has("reviewer", "taskflow.write", "*")).toBe(true)
   })
 
-  test("13 prefixed commands and 12 tools with permission and codemode:false", () => {
+  test("13 prefixed commands and 13 tools with permission and codemode:false", () => {
     expect(h.commands).toHaveLength(13)
     for (const c of h.commands) expect(c.name.startsWith("tf-")).toBe(true)
-    expect(h.tools).toHaveLength(12)
+    expect(h.tools).toHaveLength(13)
     for (const t of h.tools) {
       expect(["taskflow.read", "taskflow.write", "taskflow.dispatch"]).toContain(t.options.permission)
       expect(t.options.codemode).toBe(false)

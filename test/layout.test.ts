@@ -14,9 +14,9 @@ import { epicFile, repoWithOrigin, sh, tmpdir, write } from "./helpers.ts"
 const layout = (root: string) => ({ base: "main", mainDir: root, worktreeParent: root + "-wt" })
 const load = (root: string, global = "/nonexistent") => loadConfig(root, undefined, global)
 
-test("fresh init creates only .taskflow, no live epic, empty index, valid board; repeats byte-identically", () => {
+test("explicit standalone fresh init creates only .taskflow, no live epic, empty index, valid board; repeats byte-identically", () => {
   const root = tmpdir()
-  const c = load(root).config
+  const c = loadConfig(root, { backend: "standalone" }, "/nonexistent").config
   const r = init(root, c, layout(root))
   expect(fs.readdirSync(root)).toEqual([".taskflow"])
   expect(r.created.sort()).toEqual([
@@ -134,6 +134,7 @@ test("legacy custom paths persist across init, and existing AGENTS/GitHub files 
 test("all configured process paths survive init/reload and drive templates, shape, ship and protection", () => {
   const root = tmpdir()
   const c = loadConfig(root, {
+    backend: "standalone",
     paths: { tasks: ".taskflow/items", epics: ".taskflow/goals", board: ".taskflow/board.md", template: ".taskflow/forms/task.md", epicTemplate: ".taskflow/forms/epic.md", workflow: ".taskflow/process.md", plans: ".taskflow/shapes", standardsGuide: ".taskflow/policy/guide.md", prTemplate: ".taskflow/forms/pr.md", humanReviewTemplate: ".taskflow/forms/human.md", milestones: ".taskflow/reports" },
     standards: { index: ".taskflow/policy/index.json" },
   }, "/nonexistent").config

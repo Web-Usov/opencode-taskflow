@@ -34,6 +34,9 @@ export interface CopySpec {
 }
 
 export interface TaskflowConfig {
+  /** auto discovers existing standalone ownership; otherwise expects OpenSpec. */
+  backend: "auto" | "openspec" | "standalone"
+  openspec: { executable: string }
   language: { human: string; agent: string }
   git: {
     remote: string
@@ -99,6 +102,8 @@ const BOARD_EN = {
 
 export function defaultConfig(humanLanguage = "ru", legacy = false): TaskflowConfig {
   return {
+    backend: "auto",
+    openspec: { executable: "openspec" },
     language: { human: humanLanguage, agent: "en" },
     git: { remote: "origin", baseBranch: null, branchPrefix: "task/", worktreeDir: "../{repo}-wt" },
     paths: legacy
@@ -294,6 +299,11 @@ export function loadConfig(root: string, options: unknown = undefined, globalPat
     }
   }
   const problems = validate(config, defaults)
+  if (config.backend === "auto") config.backend = legacy || explicitLegacy ? "standalone" : discoverBackend(root)
+  if (config.backend === "openspec" && /^(opsx|openspec)(?:[-:]|$)/i.test(config.commandPrefix)) {
+    problems.push("commandPrefix: native OpenSpec prefixes are reserved; using tf- without replacing native commands")
+    config.commandPrefix = "tf-"
+  }
   // Discovery, not an inherited global path, determines the project config destination.
   config.paths.config = fs.existsSync(selected) ? path.relative(root, selected).split(path.sep).join("/") : defaults.paths.config
   if (problems.length) sources.push({ path: "(validation)", ok: false, error: problems.join("; ") })
@@ -318,6 +328,8 @@ const isModelList: Check = (v) => v === undefined || isStrArray(v)
 
 /** Field-level schema: path -> check. A failing field is reset to its default. */
 const SCHEMA: Array<[string, Check]> = [
+  ["backend", oneOf("auto", "openspec", "standalone")],
+  ["openspec.executable", isNonEmpty],
   ["language.human", isStr], ["language.agent", isStr],
   ["git.remote", isNonEmpty], ["git.baseBranch", (v) => v === null || isNonEmpty(v)], ["git.branchPrefix", isNonEmpty], ["git.worktreeDir", isNonEmpty],
   ...["config", "tasks", "epics", "board", "template", "epicTemplate", "workflow", "plans", "standardsGuide", "prTemplate", "humanReviewTemplate", "milestones"].map((k): [string, Check] => [`paths.${k}`, isNonEmpty]),
@@ -418,7 +430,15 @@ export function configStamp(root: string, globalPath = globalConfigPath()): stri
   const templates = [".github/pull_request_template.md", ".github/PULL_REQUEST_TEMPLATE/human-review.md"].map((rel) => {
     try { return fs.statSync(path.join(root, rel)).isFile() } catch { return false }
   })
-  return files + "|" + (candidates.some((f) => fs.existsSync(f)) ? "configured" : JSON.stringify(legacyLayoutSignature(root))) + "|" + JSON.stringify(templates)
+  return files + "|" + discoverBackend(root) + "|" + (candidates.some((f) => fs.existsSync(f)) ? "configured" : JSON.stringify(legacyLayoutSignature(root))) + "|" + JSON.stringify(templates)
+}
+
+/** No ancestor search and no CLI calls at host registration. Existing Taskflow config retains compatibility. */
+export function discoverBackend(root: string): "openspec" | "standalone" {
+  let central = false
+  try { const f = path.join(root, ".taskflow/workflow.md"); central = fs.statSync(f).size < 64_000 && /opencode-taskflow/.test(fs.readFileSync(f, "utf8")) } catch { /* no ownership signature */ }
+  if ([".taskflow/config.jsonc", ".opencode/taskflow.jsonc"].some((p) => fs.existsSync(path.join(root, p))) || central || hasLegacyLayout(root)) return "standalone"
+  return "openspec"
 }
 
 export function agentName(config: TaskflowConfig, role: Role): string {

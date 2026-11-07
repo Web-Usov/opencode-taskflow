@@ -1,5 +1,5 @@
 /**
- * opencode-taskflow: an OpenCode V2 plugin that runs the epic -> task -> worktree -> PR -> review -> merge workflow.
+ * opencode-taskflow: OpenSpec change execution for OpenCode V2, with a standalone Taskflow compatibility backend.
  *
  * - Registers role agents (lead, planner, implementer, reviewer, qa) with prompts, model chains and permission rules.
  *   A project agent file with the same name overrides any field it defines.
@@ -22,6 +22,8 @@ import { taskStandards, type StandardsContext } from "./core/standards.ts"
 import { isTaskSourceIdentity, readTaskSource, type TaskSourceIdentity } from "./core/task-source.ts"
 import { ROLE_DESCRIPTIONS, roleMode, rolePrompt } from "./roles.ts"
 import { buildTools, childResult, dispatchChain, taskWorktree, type DispatchInput, type DispatchResult } from "./tools.ts"
+import { dispatchChange } from "./openspec-dispatch.ts"
+import { executionLock } from "./core/openspec-execution.ts"
 
 type Ctx = Plugin.Context
 
@@ -128,7 +130,7 @@ export default define({
           if (a?.disable) continue
           const model = resolveChain(agentChain(cfg, role), available).model
           editor.update(agentName(cfg, role), (agent: any) => {
-            agent.description = ROLE_DESCRIPTIONS[role]
+            agent.description = cfg.backend === "openspec" ? `OpenSpec ${role}: ${role === "planner" ? "native planning under human control; no second backlog" : "one selected change, bound execution worktree, verification and independent PR review"}` : ROLE_DESCRIPTIONS[role]
             agent.mode = roleMode(role)
             agent.system = rolePrompt(cfg, role, lay)
             if (model) agent.model = modelRef(model)
@@ -210,10 +212,35 @@ export default define({
     // Host session metadata is durable across plugin reloads; cache only supports hosts that omit metadata on get.
     // No source snapshot or approval database: every continuation still loads the current task binding.
     const children = new Map<string, DispatchBinding>()
+    const changeChildren = new Map<string, string>()
     const dispatch = async (input: DispatchInput): Promise<DispatchResult> => {
       if (input.signal.aborted) throw new Error("aborted")
       const cfg = config()
       const agent = agentName(cfg, input.role)
+      let changeContinuation = false
+      let continuedChange: unknown
+      if (input.sessionID) {
+        const response: any = await ctx.session.get({ sessionID: input.sessionID as any })
+        changeContinuation = (response?.data ?? response)?.metadata?.taskflowOpenSpecDispatch !== undefined
+        continuedChange = (response?.data ?? response)?.metadata?.taskflowOpenSpecDispatch?.change
+      }
+      if (input.change !== undefined || changeContinuation) {
+        if (cfg.backend !== "openspec") throw new Error("OpenSpec dispatch requires backend=openspec")
+        if (loaded.sources.some((source) => !source.ok)) throw new Error("invalid/unreadable Taskflow configuration; repair the reported config diagnostics before dispatch")
+        const change = input.change ?? continuedChange
+        if (typeof change !== "string") throw new Error("invalid OpenSpec change continuation")
+        if (input.role === "implementer" && (running.get("implementer") ?? 0) >= cfg.parallel) throw new Error(`${cfg.parallel} implementer(s) already running; wait for one to finish`)
+        running.set(input.role, (running.get(input.role) ?? 0) + 1)
+        try {
+          const sourceRoot = await sessionRoot(input.parentSessionID)
+          return await executionLock(sourceRoot, change, async () => {
+            if (!available.length) await refreshModels()
+            const model = resolveChain(agentChain(cfg, input.role), available).model
+            return dispatchChange(ctx.session, sourceRoot, mainDir, cfg, input, model ? modelRef(model) : null, changeChildren)
+          }, "dispatch")
+        } finally { running.set(input.role, Math.max(0, (running.get(input.role) ?? 1) - 1)) }
+      }
+      if (cfg.backend === "openspec") throw new Error("OpenSpec mode requires an explicit change for new dispatch; legacy task dispatch is disabled")
       let taskID = input.task
       let boundDirectory: string | undefined
       let boundSource: TaskSourceIdentity | null = null
@@ -306,7 +333,7 @@ export default define({
 
     // ---- tools ----
     await ctx.tool.transform((editor) => {
-      editor.namespace({ name: "taskflow", description: "Task system and orchestration tools (opencode-taskflow)" })
+      editor.namespace({ name: "taskflow", description: config().backend === "openspec" ? "OpenSpec change execution and role orchestration (opencode-taskflow)" : "Task system and orchestration tools (opencode-taskflow)" })
       for (const t of buildTools({ root: () => root, sessionRoot, layout, config, configSources: () => loaded.sources, models: () => available, refreshModels, reloadRegistrations, dispatch })) {
         editor.add({
           name: t.name,
@@ -339,11 +366,12 @@ export default define({
       } catch {
         return
       }
-      const reason = guard(cfg, { agent: ev.agent ? String(ev.agent) : undefined, action: ev.action, resources: ev.resources }, { base: lay.base, roots: roots.length ? roots : [root], worktreeParent: lay.worktreeParent })
-      if (reason) {
-        ev.effect = "deny"
-        ev.message = reason
+      const evaluate = (executionRoot?: string) => {
+        const reason = guard(cfg, { agent: ev.agent ? String(ev.agent) : undefined, action: ev.action, resources: ev.resources }, { base: lay.base, roots: roots.length ? roots : [root], worktreeParent: lay.worktreeParent, executionRoot })
+        if (reason) { ev.effect = "deny"; ev.message = reason }
       }
+      if (cfg.backend === "openspec") return sessionRoot(String(ev.sessionID)).then(evaluate)
+      evaluate()
     })
 
     // The model registry may fill after this plugin's setup (provider plugins load in parallel, logins happen later).

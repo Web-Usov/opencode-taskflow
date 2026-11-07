@@ -1,0 +1,341 @@
+import { describe, expect, test } from "bun:test"
+import fs from "node:fs"
+import path from "node:path"
+import { defaultConfig, loadConfig } from "../src/config.ts"
+import { OpenSpec } from "../src/core/openspec.ts"
+import { cleanChange, recordChangePR, startChange } from "../src/core/openspec-execution.ts"
+import { changeIdentity, readExecution, recordDirectory, safePath, validateExecution, writeExecution } from "../src/core/openspec-source.ts"
+import { run } from "../src/core/git.ts"
+import { guard } from "../src/core/guard.ts"
+import { commandSpecs } from "../src/commands.ts"
+import { rolePrompt } from "../src/roles.ts"
+import { dispatchChange } from "../src/openspec-dispatch.ts"
+import { buildTools } from "../src/tools.ts"
+import { repoWithOrigin, sh, tmpdir, write } from "./helpers.ts"
+
+const CLI = `#!/usr/bin/env node
+const fs=require('fs'),path=require('path');
+const settings=JSON.parse(fs.readFileSync(path.join(__dirname,'settings.json'),'utf8'));
+const args=process.argv.slice(2),root=process.cwd(),name=args[args.indexOf('--change')+1]||'demo';
+fs.appendFileSync(path.join(__dirname,'calls.jsonl'),JSON.stringify({args,root})+'\\n');
+if(settings.delay) setTimeout(go,settings.delay); else go();
+function go(){
+ if(settings.nonzero){console.error('intentional failure');process.exit(2)}
+ if(settings.bad){console.log('{broken');return}
+ if(settings.huge){console.log('x'.repeat(300000));return}
+ if(args[0]==='--version'){console.log(settings.version||'1.16.1');return}
+ const base={root:{path:settings.root||root,source:settings.source||'nearest'}};
+ const dir=path.join(root,'openspec/changes',name),task=path.join(dir,'tasks.md');
+ if(args[0]==='status'){
+  if(args.includes('--all')) return console.log(JSON.stringify({...base,changes:[{changeName:'demo',schemaName:'spec-driven'}]}));
+  return console.log(JSON.stringify({...base,changeName:name,schemaName:settings.schema||'spec-driven',changeRoot:dir}));
+ }
+ if(args[0]==='validate')return console.log(JSON.stringify({...base,items:settings.empty?[]:[{id:args[1],type:'change',valid:!settings.invalid}]}));
+ const text=fs.readFileSync(task,'utf8'),done=text.includes('[x]');
+ console.log(JSON.stringify({...base,changeName:name,schemaName:settings.schema||'spec-driven',changeDir:settings.changeDir||dir,
+ contextFiles:settings.context||{proposal:[path.join(dir,'proposal.md')],tasks:[task]},
+ state:settings.state||(done?'all_done':'ready'),progress:settings.progress||{total:1,complete:done?1:0,remaining:done?0:1},
+ taskTrackingConfigured:settings.noTracking?false:true,tasks:[{id:'1',description:'Implement',done,sourcePath:settings.taskPath||task,line:1}],
+ instruction:'native reference guidance',missingPrerequisites:['design','specs'],...(settings.unavailable?{unavailableTrackingFiles:[{path:task,reason:'EACCES'}]}:{})}));
+}
+`
+
+function fixture() {
+  const repo = repoWithOrigin({ "README.md": "base" })
+  sh("git", ["checkout", "-qb", "planning"], repo.main)
+  for (const [rel, text] of Object.entries({ "openspec/config.yaml": "schema: spec-driven\n", "openspec/changes/demo/.openspec.yaml": "schema: spec-driven\nskip_specs: true\n", "openspec/changes/demo/tasks.md": "- [ ] Implement\n", "openspec/changes/demo/proposal.md": "# Proposal\nChange scope\n" })) write(repo.main, rel, text)
+  sh("git", ["add", "-A"], repo.main); sh("git", ["commit", "-qm", "plan off main"], repo.main)
+  const bin = path.join(repo.dir, "bin")
+  write(bin, "openspec", CLI); fs.chmodSync(path.join(bin, "openspec"), 0o755)
+  write(bin, "settings.json", "{}")
+  const cfg = defaultConfig("en"); cfg.backend = "openspec"; cfg.git.baseBranch = "main"; cfg.git.worktreeDir = path.join(repo.dir, "worktrees"); cfg.openspec.executable = path.join(bin, "openspec")
+  const settings = (value: object) => write(bin, "settings.json", JSON.stringify(value))
+  const calls = () => fs.readFileSync(path.join(bin, "calls.jsonl"), "utf8").trim().split("\n").map((s) => JSON.parse(s))
+  return { ...repo, cfg, settings, calls, bin, adapter: new OpenSpec(cfg), signal: new AbortController().signal }
+}
+
+describe("OpenSpec read-only adapter", () => {
+  test("exact named machine commands, bounded reads, readiness independent of missing planning prerequisites, no mutation", async () => {
+    const h = fixture()
+    const before = sh("git", ["status", "--porcelain"], h.main)
+    const c = await h.adapter.inspect(h.main, "demo", h.signal)
+    expect(c.state).toBe("ready"); expect(c.missingPrerequisites).toEqual(["design", "specs"])
+    expect(c.references).toHaveLength(2)
+    expect(h.calls().map((c) => c.args)).toEqual([["--version"], ["status", "--change", "demo", "--json"], ["instructions", "apply", "--change", "demo", "--json"], ["validate", "demo", "--type", "change", "--json", "--no-interactive"]])
+    expect(sh("git", ["status", "--porcelain"], h.main)).toBe(before)
+    expect(fs.existsSync(path.join(h.main, ".taskflow"))).toBe(false)
+  })
+  test("missing CLI, unsupported version, malformed/nonzero/oversized and abort fail closed", async () => {
+    const h = fixture()
+    for (const settings of [{ version: "1.15.0" }, { bad: true }, { nonzero: true }, { huge: true }]) {
+      h.settings(settings)
+      await expect(h.adapter.inspect(h.main, "demo", h.signal)).rejects.toThrow()
+    }
+    h.settings({})
+    await expect(new OpenSpec({ ...h.cfg, openspec: { executable: path.join(h.dir, "missing") } }).inspect(h.main, "demo")).rejects.toThrow("unavailable")
+    const controller = new AbortController(); controller.abort()
+    await expect(h.adapter.inspect(h.main, "demo", controller.signal)).rejects.toThrow("aborted")
+    const result = await run("node", ["-e", "setTimeout(()=>{},10000)"], h.main, { timeout: 20, maxOutputBytes: 100 })
+    expect(result.ok).toBe(false); expect(result.stderr).toContain("timed out")
+    h.settings({ delay: 10_000 })
+    const aborted = new AbortController(), pending = h.adapter.inspect(h.main, "demo", aborted.signal)
+    setTimeout(() => aborted.abort(), 100)
+    await expect(pending).rejects.toThrow("aborted")
+    const huge = await run("node", ["-e", "process.stdout.write('x'.repeat(10000))"], h.main, { maxOutputBytes: 32, timeout: 1000 })
+    expect(huge.ok).toBe(false); expect(huge.stdout).toBe(""); expect(huge.stderr).toContain("output budget")
+  })
+  test("rejects drift, partial tracking, unknown/custom/no-tracking schema and empty/invalid validation", async () => {
+    const h = fixture()
+    for (const settings of [{ root: h.dir }, { source: "implicit" }, { source: "global_default" }, { unavailable: true }, { schema: "custom" }, { noTracking: true }, { invalid: true }, { empty: true }, { changeDir: h.main }, { taskPath: "/outside/tasks.md" }, { context: { tasks: "not-array" } }, { progress: { total: 1, complete: 1, remaining: 1 } }]) {
+      h.settings(settings)
+      await expect(h.adapter.inspect(h.main, "demo", h.signal)).rejects.toThrow()
+    }
+    h.settings({}); write(h.main, "openspec/schemas/spec-driven/schema.yaml", "shadow")
+    await expect(h.adapter.inspect(h.main, "demo")).rejects.toThrow("shadowed")
+  })
+  test("confinement: traversal, secret/hidden/dependency/ignored, untracked, symlink and unreadable context", async () => {
+    const h = fixture()
+    for (const name of ["../demo", "archive", "/demo", "demo/../other"]) await expect(h.adapter.inspect(h.main, name)).rejects.toThrow()
+    for (const rel of ["../outside.md", ".hidden.md", "node_modules/x.md", "credentials.md"]) {
+      const file = path.join(h.main, "openspec/changes/demo", rel)
+      h.settings({ context: { tasks: [file] } })
+      await expect(h.adapter.inspect(h.main, "demo")).rejects.toThrow()
+    }
+    h.settings({})
+    const task = path.join(h.main, "openspec/changes/demo/tasks.md")
+    fs.chmodSync(task, 0)
+    await expect(h.adapter.inspect(h.main, "demo")).rejects.toThrow("unreadable")
+    fs.chmodSync(task, 0o644)
+    write(h.main, ".gitignore", "tasks.md\n")
+    await expect(h.adapter.inspect(h.main, "demo")).rejects.toThrow("ignored")
+    fs.unlinkSync(path.join(h.main, ".gitignore"))
+    fs.renameSync(task, task + ".old"); fs.symlinkSync(task + ".old", task)
+    await expect(h.adapter.inspect(h.main, "demo")).rejects.toThrow("symlink")
+  })
+})
+
+describe("OpenSpec execution lifecycle with real git", () => {
+  test("explicit intent, committed calling HEAD not main, no duplicate claim or planning mutation", async () => {
+    const h = fixture()
+    await expect(startChange(h.main, h.cfg, "demo", false, h.signal)).rejects.toThrow("explicit")
+    write(h.main, "untracked-user", "preserve")
+    await expect(startChange(h.main, h.cfg, "demo", true, h.signal)).rejects.toThrow("dirty/untracked")
+    fs.unlinkSync(path.join(h.main, "untracked-user"))
+    const source = sh("git", ["rev-parse", "HEAD"], h.main)
+    expect(sh("git", ["ls-tree", "--name-only", "main", "openspec/"], h.main)).toBe("")
+    const r = await startChange(h.main, h.cfg, "demo", true, h.signal)
+    expect(r.sourceCommit).toBe(source)
+    expect(sh("git", ["rev-parse", "HEAD"], r.worktree)).toBe(source)
+    expect(sh("git", ["status", "--porcelain"], h.main)).toBe("")
+    expect(sh("git", ["status", "--porcelain"], r.worktree)).toBe("")
+    expect(validateExecution(h.main, "demo")).toEqual(r)
+    await expect(startChange(h.main, h.cfg, "demo", true, h.signal)).rejects.toThrow("already")
+    expect(fs.existsSync(path.join(r.worktree, ".taskflow"))).toBe(false)
+  })
+  test("collisions and failed/cancelled setup preserve all user content and commits", async () => {
+    const h = fixture()
+    sh("git", ["branch", "openspec/demo"], h.main)
+    await expect(startChange(h.main, h.cfg, "demo", true, h.signal)).rejects.toThrow("collision")
+    sh("git", ["branch", "-D", "openspec/demo"], h.main)
+    h.cfg.setup.commands = ["printf user-work > untracked-user; exit 1"]
+    await expect(startChange(h.main, h.cfg, "demo", true, h.signal)).rejects.toThrow("preserved")
+    const r = readExecution(h.main, "demo")
+    expect(r.phase).toBe("setup_failed")
+    expect(fs.readFileSync(path.join(r.worktree, "untracked-user"), "utf8")).toBe("user-work")
+    expect(sh("git", ["branch", "--show-current"], r.worktree)).toBe("openspec/demo")
+    await expect(cleanChange(h.main, h.cfg, "demo", true, h.signal)).rejects.toThrow("no verified")
+  })
+  test("abort during configured setup preserves newly created ignored/untracked work", async () => {
+    const h = fixture(), controller = new AbortController()
+    h.cfg.setup.commands = ["printf keep > cancelled-user; sleep 20"]
+    fs.mkdirSync(h.cfg.git.worktreeDir, { recursive: true })
+    const watcher = fs.watch(h.cfg.git.worktreeDir, { recursive: true }, (_event, name) => { if (String(name).endsWith("cancelled-user")) controller.abort() })
+    const timeout = setTimeout(() => controller.abort(), 5000)
+    try {
+      await expect(startChange(h.main, h.cfg, "demo", true, controller.signal)).rejects.toThrow("preserved")
+      const record = readExecution(h.main, "demo")
+      expect(record.phase).toBe("setup_failed")
+      expect(fs.existsSync(path.join(record.worktree, "cancelled-user"))).toBe(true)
+      expect(fs.existsSync(record.worktree)).toBe(true)
+    } finally { watcher.close(); clearTimeout(timeout) }
+  })
+  test("record confinement and schema/config/source substitution fail closed; checklist refresh is allowed", async () => {
+    const h = fixture(); const r = await startChange(h.main, h.cfg, "demo", true, h.signal)
+    write(r.worktree, "openspec/changes/demo/tasks.md", "- [x] Implement\n")
+    expect(validateExecution(h.main, "demo").change).toBe("demo")
+    write(r.worktree, "openspec/changes/demo/proposal.md", "unauthorized planning drift")
+    expect(() => validateExecution(h.main, "demo")).toThrow("identity changed")
+    write(r.worktree, "openspec/changes/demo/proposal.md", "# Proposal\nChange scope\n")
+    write(r.worktree, "openspec/config.yml", "schema: custom\n")
+    expect(() => validateExecution(h.main, "demo")).toThrow("identity changed")
+    fs.unlinkSync(path.join(r.worktree, "openspec/config.yml"))
+    const record = path.join(recordDirectory(h.main), "demo.json")
+    fs.renameSync(record, record + ".old"); fs.symlinkSync(record + ".old", record)
+    expect(() => readExecution(h.main, "demo")).toThrow("unsafe")
+    expect(() => safePath(h.main, "openspec/../README.md")).toThrow("unsafe")
+  })
+  test("preflight rejects hidden-index/config ambiguity; exclusive atomic records never replace an existing association", async () => {
+    const h = fixture()
+    sh("git", ["update-index", "--skip-worktree", "README.md"], h.main)
+    await expect(startChange(h.main, h.cfg, "demo", true, h.signal)).rejects.toThrow("skip-worktree")
+    sh("git", ["update-index", "--no-skip-worktree", "README.md"], h.main)
+    write(h.main, ".gitignore", ".taskflow/\n")
+    sh("git", ["add", ".gitignore"], h.main); sh("git", ["commit", "-qm", "ignore local config"], h.main)
+    write(h.main, ".taskflow/config.jsonc", '{"backend":"openspec"}')
+    await expect(startChange(h.main, h.cfg, "demo", true, h.signal)).rejects.toThrow("not committed")
+    fs.unlinkSync(path.join(h.main, ".taskflow/config.jsonc"))
+    const dir = recordDirectory(h.main); fs.mkdirSync(dir, { recursive: true }); write(dir, "demo.lock", "other operation")
+    await expect(startChange(h.main, h.cfg, "demo", true, h.signal)).rejects.toThrow("locked")
+    fs.unlinkSync(path.join(dir, "demo.lock"))
+    const r = await startChange(h.main, h.cfg, "demo", true, h.signal)
+    expect(() => writeExecution(h.main, r, true)).toThrow()
+    expect(readExecution(h.main, "demo")).toEqual(r)
+    const stale = readExecution(h.main, "demo"), current = readExecution(h.main, "demo")
+    current.phase = "review"; writeExecution(h.main, current)
+    stale.phase = "setup_failed"
+    expect(() => writeExecution(h.main, stale)).toThrow("changed since read")
+    expect(readExecution(h.main, "demo").phase).toBe("review")
+    const task = path.join(r.worktree, r.identity.tracking)
+    fs.renameSync(task, task + ".old"); fs.symlinkSync(task + ".old", task)
+    expect(() => validateExecution(h.main, "demo")).toThrow("symlink")
+  })
+  test("guard permits only associated actual tracked checklist, not arbitrary task-shaped files or native planning", async () => {
+    const h = fixture(); const r = await startChange(h.main, h.cfg, "demo", true, h.signal)
+    const ctx = { base: "main", roots: [h.main, r.worktree], executionRoot: r.worktree }
+    const edit = (file: string) => guard(h.cfg, { agent: "implementer", action: "edit", resources: [file] }, ctx)
+    expect(edit("openspec/changes/demo/tasks.md")).toBeNull()
+    for (const file of ["openspec/changes/other/tasks.md", "openspec/changes/demo/design.md", "openspec/specs/cap/spec.md", "openspec/config.yml", "openspec/schemas/custom/schema.yaml", ".taskflow/config.jsonc", "openspec/changes/demo/.openspec.yaml"]) expect(edit(file)).toContain("protected")
+    expect(guard(h.cfg, { agent: "implementer", action: "edit", resources: ["openspec/changes/demo/tasks.md"] }, { ...ctx, executionRoot: h.main })).toContain("protected")
+  })
+  test("verified PR association and merged-only cleanup refuse dirty/untracked/extra/unpushed work and preserve native sources", async () => {
+    const h = fixture(), r = await startChange(h.main, h.cfg, "demo", true, h.signal)
+    write(r.worktree, "openspec/changes/demo/tasks.md", "- [x] Implement\n")
+    sh("git", ["add", "-A"], r.worktree); sh("git", ["commit", "-qm", "implementation"], r.worktree)
+    const head = sh("git", ["rev-parse", "HEAD"], r.worktree)
+    let state = "OPEN", invalid = false
+    const url = "https://github.com/example/app/pull/1"
+    const gh = async (cmd: string, args: string[]) => ({ ok: true, code: 0, stderr: "", stdout: JSON.stringify(args[0] === "repo" ? { url: "https://github.com/example/app" } : { url, state, headRefName: invalid ? "other" : r.branch, headRefOid: head, baseRefName: "main", isCrossRepository: false }) })
+    invalid = true
+    await expect(recordChangePR(h.main, h.cfg, "demo", url, h.signal, gh)).rejects.toThrow("associated")
+    invalid = false
+    const associated = await recordChangePR(h.main, h.cfg, "demo", url, h.signal, gh)
+    expect(associated.pr).toBe(url)
+    await expect(cleanChange(h.main, h.cfg, "demo", false, h.signal, gh)).rejects.toThrow("explicit")
+    await expect(cleanChange(h.main, h.cfg, "demo", true, h.signal, gh)).rejects.toThrow("MERGED")
+    state = "MERGED"
+    write(r.worktree, "user-work", "keep")
+    await expect(cleanChange(h.main, h.cfg, "demo", true, h.signal, gh)).rejects.toThrow("lose")
+    expect(fs.existsSync(r.worktree)).toBe(true)
+    sh("git", ["add", "-A"], r.worktree); sh("git", ["commit", "-qm", "extra unpushed work"], r.worktree)
+    await expect(cleanChange(h.main, h.cfg, "demo", true, h.signal, gh)).rejects.toThrow("extra/unpushed")
+    // A separate execution proves success without discarding the intentionally preserved extra commit above.
+    const k = fixture(), clean = await startChange(k.main, k.cfg, "demo", true, k.signal)
+    write(clean.worktree, "openspec/changes/demo/tasks.md", "- [x] Implement\n")
+    sh("git", ["add", "-A"], clean.worktree); sh("git", ["commit", "-qm", "implementation"], clean.worktree)
+    const cleanHead = sh("git", ["rev-parse", "HEAD"], clean.worktree)
+    const merged = async (_cmd: string, args: string[]) => ({ ok: true, code: 0, stderr: "", stdout: JSON.stringify(args[0] === "repo" ? { url: "https://github.com/example/app" } : { url, state: "MERGED", headRefName: clean.branch, headRefOid: cleanHead, baseRefName: "main", isCrossRepository: false }) })
+    await recordChangePR(k.main, k.cfg, "demo", url, k.signal, merged)
+    write(k.main, ".git/info/exclude", "generated\n")
+    write(clean.worktree, "generated/user.md", "ignored user work")
+    await expect(cleanChange(k.main, k.cfg, "demo", true, k.signal, merged)).rejects.toThrow("ignored")
+    expect(fs.readFileSync(path.join(clean.worktree, "generated/user.md"), "utf8")).toBe("ignored user work")
+    fs.unlinkSync(path.join(clean.worktree, "generated/user.md")); fs.rmdirSync(path.join(clean.worktree, "generated"))
+    await expect(cleanChange(k.main, k.cfg, "demo", true, k.signal, async () => ({ ok: false, code: 1, stdout: "", stderr: "unknown PR" }))).rejects.toThrow("unknown PR")
+    expect((await cleanChange(k.main, k.cfg, "demo", true, k.signal, merged)).phase).toBe("cleaned")
+    expect(fs.existsSync(clean.worktree)).toBe(false)
+    expect(fs.existsSync(path.join(k.main, "openspec/changes/demo/tasks.md"))).toBe(true)
+    expect(sh("git", ["branch", "--list", clean.branch], k.main)).toBe("")
+  })
+})
+
+describe("change dispatch durable binding and host tools", () => {
+  function fakeHost() {
+    const sessions = new Map<string, any>(), prompts: any[] = [], creates: any[] = []
+    return { sessions, prompts, creates, host: {
+      get: async ({ sessionID }: any) => sessions.get(sessionID),
+      create: async (input: any) => { const session = { id: `child_${sessions.size}`, ...structuredClone(input) }; sessions.set(session.id, session); creates.push(input); return session },
+      prompt: async (input: any) => { prompts.push(input) }, wait: async () => {}, interrupt: async () => {},
+      context: async () => [{ type: "assistant", content: [{ type: "text", text: "VERDICT: LGTM" }] }],
+    } }
+  }
+  test("both roles share refs/hashes/source while reviewer cwd main; reload/omitted change refresh and contradictions denied", async () => {
+    const h = fixture(), f = fakeHost(); const r = await startChange(h.main, h.cfg, "demo", true, h.signal)
+    const input = { role: "implementer" as const, change: "demo", prompt: "implement", parentSessionID: "parent", signal: h.signal }
+    const implementer = await dispatchChange(f.host, h.main, h.main, h.cfg, input, null)
+    const reviewer = await dispatchChange(f.host, h.main, h.main, h.cfg, { ...input, role: "reviewer" }, null)
+    expect(implementer.references).toEqual(reviewer.references)
+    expect(implementer.directory).toBe(r.worktree); expect(reviewer.directory).toBe(h.main)
+    expect(f.prompts[0].text.split("OpenSpec reference data")[1]).toBe(f.prompts[1].text.split("OpenSpec reference data")[1])
+    // No in-memory cache exists: a new host object with JSON round-tripped sessions behaves like reload.
+    const host = { ...f.host, get: async ({ sessionID }: any) => JSON.parse(JSON.stringify(f.sessions.get(sessionID))) }
+    write(r.worktree, "openspec/changes/demo/tasks.md", "- [x] Implement\n")
+    const continued = await dispatchChange(host, h.main, h.main, h.cfg, { ...input, change: undefined, sessionID: implementer.sessionID }, null)
+    expect(continued.references).not.toEqual(implementer.references)
+    const before = f.prompts.length
+    const changed = structuredClone(h.cfg); changed.verify.full = "different-verify"
+    await expect(dispatchChange(host, h.main, h.main, changed, { ...input, sessionID: implementer.sessionID }, null)).rejects.toThrow("configuration changed")
+    for (const delta of [{ change: "other" }, { role: "reviewer" }, { directory: h.main }, { parentSessionID: "other" }, { task: "T-001" }]) await expect(dispatchChange(host, h.main, h.main, h.cfg, { ...input, sessionID: implementer.sessionID, ...delta } as any, null)).rejects.toThrow()
+    expect(f.prompts.length).toBe(before)
+    write(r.worktree, "openspec/config.yaml", "schema: changed\n")
+    await expect(dispatchChange(host, h.main, h.main, h.cfg, { ...input, sessionID: implementer.sessionID }, null)).rejects.toThrow("identity changed")
+  })
+  test("OpenSpec mode doctor/init are no-write, legacy backlog tools blocked and commands never request T-tasks", async () => {
+    const h = fixture()
+    const layout = { base: "main", mainDir: h.main, worktreeParent: path.join(h.dir, "worktrees") }
+    const host = { root: () => h.main, sessionRoot: async () => h.main, layout: () => layout, config: () => h.cfg, configSources: () => [], models: () => [], refreshModels: async () => {}, reloadRegistrations: async () => {}, dispatch: async () => { throw new Error("not expected") } }
+    const tools = buildTools(host), ctx = { sessionID: "parent", signal: h.signal }
+    for (const name of ["tf_init", "tf_models", "tf_status"]) expect(await tools.find((t) => t.name === name)!.execute({}, ctx)).toContain("1.16.1")
+    for (const name of ["tf_start", "tf_set", "tf_board", "tf_clean", "tf_standards"]) expect(await tools.find((t) => t.name === name)!.execute({}, ctx)).toContain("disabled in OpenSpec")
+    expect(fs.existsSync(path.join(h.main, ".taskflow"))).toBe(false)
+    expect(commandSpecs(h.cfg, layout).every((c) => !c.claimArg)).toBe(true)
+    expect(rolePrompt(h.cfg, "implementer", layout)).not.toContain("tf_board")
+    const fresh = tmpdir(); expect(loadConfig(fresh, undefined, path.join(fresh, "absent")).config.backend).toBe("openspec")
+  })
+  test("actual plugin registration and tools/commands dispatch both roles and recover after reload without native takeover", async () => {
+    const h = fixture(), f = fakeHost()
+    const tools: any[] = [], commands: any[] = [], agents = new Map(), hooks = new Map()
+    f.sessions.set("parent", { id: "parent", location: { directory: h.main } })
+    const ctx: any = {
+      location: { directory: h.main }, options: h.cfg,
+      agent: { transform: async (callback: any) => callback({ update: (name: string, fn: any) => { const value = {}; fn(value); agents.set(name, value) } }), reload: async () => {} },
+      command: { transform: async (callback: any) => callback({ add: (value: any) => commands.push(value) }), reload: async () => {} },
+      tool: { transform: async (callback: any) => callback({ namespace: () => {}, add: (value: any) => tools.push(value) }) },
+      permission: { hook: async (name: string, fn: any) => hooks.set(name, fn) }, model: { list: async () => [] }, session: f.host,
+    }
+    const plugin = (await import("../src/index.ts")).default
+    let cleanup: any = await plugin.setup(ctx)
+    const context = { sessionID: "parent", agent: "lead", signal: h.signal }
+    try {
+      expect(commands.every((c) => c.name.startsWith("tf-"))).toBe(true)
+      expect(commands.some((c) => c.name.startsWith("opsx"))).toBe(false)
+      expect(agents.get("implementer").system).toContain("execution extension")
+      await commands.find((c) => c.name === "tf-next").execute({ sessionID: "parent", prompt: { text: "demo" } })
+      expect(f.prompts.at(-1).text).toContain("explicitly asks")
+      expect(fs.existsSync(recordDirectory(h.main))).toBe(false)
+      expect((await tools.find((t) => t.name === "tf_openspec").execute({ operation: "start", change: "demo", confirm: true }, context)).content).toContain('"phase": "claimed"')
+      const tool = tools.find((t) => t.name === "tf_dispatch")
+      const result = await tool.execute({ role: "implementer", change: "demo", prompt: "work" }, context)
+      const sessionID = result.content.match(/child session: (\S+)/)[1]
+      expect(result.content).toContain("OpenSpec references")
+      expect((await tool.execute({ role: "reviewer", change: "demo", prompt: "review" }, context)).content).toContain("VERDICT: LGTM")
+      cleanup(); tools.length = 0; commands.length = 0
+      cleanup = await plugin.setup(ctx)
+      expect((await tools.find((t) => t.name === "tf_dispatch").execute({ role: "implementer", sessionID, prompt: "continue after reload" }, context)).content).toContain("VERDICT: LGTM")
+      const event = { agent: "implementer", sessionID, action: "edit", resources: ["openspec/changes/demo/tasks.md"], effect: "allow" }
+      await hooks.get("evaluate")(event)
+      expect(event.effect).toBe("allow")
+      let entered!: () => void, release!: () => void
+      const waiting = new Promise<void>((resolve) => { entered = resolve })
+      f.host.wait = async () => { entered(); await new Promise<void>((resolve) => { release = resolve }) }
+      const resumed = tools.find((t) => t.name === "tf_dispatch")
+      const pending = resumed.execute({ role: "implementer", sessionID, prompt: "one active change lease" }, context)
+      await waiting
+      try {
+        expect((await resumed.execute({ role: "reviewer", change: "demo", prompt: "must not overlap" }, context)).content).toContain("locked")
+        await expect(cleanChange(h.main, h.cfg, "demo", true, h.signal)).rejects.toThrow("locked")
+      } finally { release() }
+      expect((await pending).content).toContain("VERDICT: LGTM")
+      expect(fs.readdirSync(recordDirectory(h.main)).some((name) => name.endsWith(".lock"))).toBe(false)
+    } finally { cleanup() }
+  })
+})

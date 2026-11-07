@@ -1,6 +1,8 @@
 import path from "node:path"
 import type { Role, TaskflowConfig } from "../config.ts"
 import { agentName, ROLES } from "../config.ts"
+import { validateExecution } from "./openspec-source.ts"
+import { worktreeRoot } from "./git.ts"
 
 export interface Rule {
   action: string
@@ -13,6 +15,7 @@ export const TOOL_PERMISSION = { read: "taskflow.read", write: "taskflow.write",
 
 /** Process artifacts always require the planner/human gate, independent of project protected overrides. */
 export function protectedPaths(cfg: TaskflowConfig): string[] {
+  if (cfg.backend === "openspec") return [...cfg.protected, "openspec/**", ".taskflow/**", ".opencode/**", ".agents/**", ".claude/**", ".git/**"]
   // An index/guide at the namespace root must not accidentally protect the task directory or board.
   const directory = (file: string) => {
     const dir = path.posix.dirname(file)
@@ -108,6 +111,7 @@ export function roleRules(cfg: TaskflowConfig, role: Role, layout: RepoLayout): 
   const protectedEdit = protectedPaths(cfg).flatMap(everywhere).map((r) => deny("edit", r))
   switch (role) {
     case "implementer":
+      if (cfg.backend === "openspec") return [...common, ...noMerge, ...protectedEdit, ...everywhere("openspec/changes/*/tasks.md").map((r) => allow("edit", r)), ...tools(true, false)]
       return [...common, ...noMerge, ...protectedEdit, ...tools(true, false)]
     case "qa":
       return [...common, ...noMerge, deny("edit", "*"), ...cfg.qaPaths.map((g) => allow("edit", toWildcard(g))), ...tools(false, false)]
@@ -330,6 +334,8 @@ export function badPush(cmd: string, base: string): string | null {
 }
 
 export interface GuardContext {
+  /** Exact calling session worktree, used for native checklist write authorization. */
+  executionRoot?: string
   base: string
   /** Absolute roots of every worktree of the repository. */
   roots: readonly string[]
@@ -377,6 +383,25 @@ export function guard(cfg: TaskflowConfig, ev: GuardEvent, ctx: GuardContext): s
   const role = ROLES.find((r) => agentName(cfg, r) === ev.agent)
   if (!role) return null
   if (ev.action === "edit" && role !== "planner") {
+    if (cfg.backend === "openspec") {
+      for (const resource of ev.resources) {
+        const relative = relativize(resource, ctx.roots, ctx.worktreeParent)
+        if (!matchesAny(relative, protectedPaths(cfg))) continue
+        const match = /^openspec\/changes\/([a-z][a-z0-9-]*)\/tasks\.md$/.exec(relative)
+        if (role === "implementer" && match) {
+          try {
+            const absolute = path.isAbsolute(resource) ? resource : null
+            const candidates = ctx.executionRoot ? [ctx.executionRoot] : absolute ? [worktreeRoot(path.dirname(absolute))].filter((r): r is string => !!r) : []
+            const allowed = candidates.some((root) => {
+              try { const r = validateExecution(root, match[1]!); return r.phase !== "setup_failed" && r.worktree === root && (!absolute || path.join(root, r.identity.tracking) === path.normalize(absolute)) } catch { return false }
+            })
+            if (allowed) continue
+          } catch { /* fail closed */ }
+        }
+        return `taskflow: ${relative} is protected native planning/config/schema; only the actual associated tracked checklist is writable during implementation`
+      }
+      return null
+    }
     const hit = ev.resources.map((r) => relativize(r, ctx.roots, ctx.worktreeParent)).find((r) => matchesAny(r, protectedPaths(cfg)))
     if (hit) return `taskflow: ${hit} is a protected path (${protectedPaths(cfg).join(", ")}); only the planner changes it, through a PR a human merges`
   }

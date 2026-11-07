@@ -2,7 +2,18 @@
 
 ## 0.2.0 — unreleased
 
-- Fresh projects keep all Taskflow process artifacts under tracked `.taskflow/`, with configurable workflow, plans and
+- Product pivot: execution extension for existing OpenSpec, without a second planning backlog or mandatory Taskflow init.
+  Tested published CLI 1.16.1, repo-local roots and unshadowed built-in spec-driven only. Native commands/skills/artifacts
+  remain unchanged by registration/diagnosis/claim. Custom schemas/stores/other versions fail explicitly.
+- `tf_openspec` status/inspect/start/pr/clean, change-aware `tf_dispatch`, mode-aware tf commands/prompts and edit guard.
+  One change/worktree/branch/PR, explicit execution intent, committed calling-worktree HEAD, bounded async CLI reads,
+  complete confined context and selected validation; no installs, native init/update/archive or approval claims.
+- Local execution associations in git-common-dir `.taskflow/openspec`, separate change metadata and durable dispatch key;
+  independent reviewer uses the same source worktree from main. Setup failure preserves work; cleanup requires associated
+  MERGED PR and exact pushed head with no dirty/untracked/extra work. No automatic remote deletion or base fast-forward.
+- Backend discovery retains existing standalone projects; fresh missing-OpenSpec projects diagnose dependencies.
+  Explicit `backend: standalone` retains the previous initialization workflow. Existing task metadata v2 is unchanged.
+- Standalone projects keep all Taskflow process artifacts under tracked `.taskflow/`, with configurable workflow, plans and
   templates. Central config takes precedence over legacy project config; existing legacy layouts remain supported,
   without automatic moves. Init no longer creates a live sample epic or touches AGENTS/GitHub without explicit opt-in.
 - Config/workflow detection stays consistent; central standards reads retain hidden-path and symlink confinement.
