@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, test } from "bun:test"
 import fs from "node:fs"
 import path from "node:path"
-import { repoWithOrigin, TEMPLATE, epicFile, taskFile } from "./helpers.ts"
+import { repoWithOrigin, TEMPLATE, epicFile, taskFile, sh, write } from "./helpers.ts"
 
 const T = 60_000
 
@@ -10,6 +10,83 @@ const CONFIG = JSON.stringify({
     implementer: { models: ["acme/disabled#low", "acme/good#low"] },
     reviewer: { models: ["acme/good#low"] },
   },
+})
+
+describe("standards dispatch integration (no live models)", () => {
+  async function boundRepo() {
+    const h = await boot()
+    const wt = path.join(h.dir, "bound-worktree")
+    sh("git", ["worktree", "add", "-q", "-b", "task/T-001-bound", wt], h.main)
+    const entry = { id: "chosen", title: "Chosen convention", path: "docs/rules.md", status: "approved" }
+    write(wt, "docs/standards/index.json", JSON.stringify({ version: 1, entries: [entry] }))
+    write(wt, "docs/rules.md", "# Bound source\nWORKTREE CONTENT; subordinate to AGENTS/spec/guard.")
+    const task = taskFile({ id: "T-001", title: "First task" }).replace("spec: []", "spec: []\nstandards: [chosen]")
+    write(wt, "tasks/T-001-first-task.md", task)
+    // Main deliberately has a stale, invalid binding: reviewer must not use it.
+    write(h.main, "tasks/T-001-first-task.md", task.replace("[chosen]", "[stale-main]"))
+    return { ...h, wt, task, entry, tool: h.tools.find((t) => t.name === "tf_dispatch"), context: { sessionID: "ses_parent", agent: "lead", signal: new AbortController().signal } }
+  }
+
+  test("implementer and reviewer receive exact same ids, refs, contents and hashes from task worktree", async () => {
+    const h = await boundRepo()
+    try {
+      const results = []
+      for (const role of ["implementer", "reviewer"]) results.push(await h.tool.execute({ role, task: "T-001", prompt: "Do assigned work" }, h.context))
+      const prompts = h.calls.filter((c) => c.fn === "session.prompt").map((c) => c.arg.text)
+      expect(prompts).toHaveLength(2)
+      const bindings = prompts.map((p: string) => p.slice(p.indexOf("Standards binding source:")))
+      expect(bindings[0]).toBe(bindings[1])
+      expect(bindings[0]).toContain(h.wt)
+      expect(bindings[0]).toContain("chosen")
+      expect(bindings[0]).toContain("docs/rules.md")
+      expect(bindings[0]).toContain("WORKTREE CONTENT")
+      expect(bindings[0]).not.toContain("stale-main")
+      expect(bindings[0]).toContain("not instructions to bypass permissions")
+      const creates = h.calls.filter((c) => c.fn === "session.create")
+      expect(creates[0]!.arg.location.directory).toBe(h.wt)
+      expect(creates[1]!.arg.location.directory).toBe(h.main)
+      for (const r of results) {
+        expect(r.content).toContain("chosen -> docs/rules.md (sha256")
+        expect(r.content).toContain("VERDICT: LGTM")
+      }
+    } finally { h.cleanup() }
+  })
+
+  test("missing/draft/invalid/oversized bindings fail before child creation or prompt, atomically", async () => {
+    const h = await boundRepo()
+    try {
+      const variants = [
+        { binding: "[unknown]" },
+        { binding: "chosen" },
+        { binding: "[chosen, chosen]" },
+        { binding: "[chosen]", status: "draft" },
+        { binding: "[chosen]", missingIndex: true },
+        { binding: "[chosen]", badIndex: true },
+        { binding: "[chosen]", missingSource: true },
+        { binding: "[chosen]", source: "x".repeat(25_000) },
+        { binding: "[chosen]", sourcePath: "../outside.md" },
+        { binding: "[chosen, missing]", second: true },
+      ]
+      for (const v of variants) {
+        write(h.wt, "tasks/T-001-first-task.md", h.task.replace("standards: [chosen]", `standards: ${v.binding}`))
+        write(h.wt, "docs/rules.md", v.source ?? "GOOD DATA MUST NOT PARTIALLY INJECT")
+        const entries = [{ ...h.entry, status: v.status ?? "approved", path: v.sourcePath ?? h.entry.path }, ...(v.second ? [{ ...h.entry, id: "missing", path: "docs/missing.md" }] : [])]
+        write(h.wt, "docs/standards/index.json", v.badIndex ? "{broken" : JSON.stringify({ version: 1, entries }))
+        if (v.missingIndex) fs.unlinkSync(path.join(h.wt, "docs/standards/index.json"))
+        if (v.missingSource) fs.unlinkSync(path.join(h.wt, "docs/rules.md"))
+        const before = h.calls.length
+        for (const role of ["implementer", "reviewer"]) {
+          const r = await h.tool.execute({ role, task: "T-001", prompt: "work" }, h.context)
+          expect(r.content).toContain("ERROR: dispatch failed")
+          expect(r.content).not.toContain("GOOD DATA")
+        }
+        expect(h.calls.slice(before).some((c) => ["session.create", "session.prompt"].includes(c.fn))).toBe(false)
+      }
+      const before = h.calls.length
+      expect((await h.tool.execute({ role: "reviewer", task: "T-404", prompt: "work" }, h.context)).content).toContain("not found")
+      expect(h.calls.slice(before).some((c) => c.fn === "session.create")).toBe(false)
+    } finally { h.cleanup() }
+  })
 })
 
 function makeRepo() {
@@ -118,10 +195,10 @@ describe("plugin entry with a fake OpenCode context", () => {
     expect(has("reviewer", "taskflow.write", "*")).toBe(true)
   })
 
-  test("10 prefixed commands and 11 tools with permission and codemode:false", () => {
-    expect(h.commands).toHaveLength(10)
+  test("13 prefixed commands and 12 tools with permission and codemode:false", () => {
+    expect(h.commands).toHaveLength(13)
     for (const c of h.commands) expect(c.name.startsWith("tf-")).toBe(true)
-    expect(h.tools).toHaveLength(11)
+    expect(h.tools).toHaveLength(12)
     for (const t of h.tools) {
       expect(["taskflow.read", "taskflow.write", "taskflow.dispatch"]).toContain(t.options.permission)
       expect(t.options.codemode).toBe(false)

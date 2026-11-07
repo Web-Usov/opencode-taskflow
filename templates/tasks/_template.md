@@ -6,6 +6,7 @@ epic: E-01            # epics/E-xx-*.md
 depends: []           # [T-001, T-002] - must be done before this task starts
 blocked_by: []        # [Q-01] - open questions that block the task
 spec: []              # rule IDs this task implements, e.g. [OP-05]
+standards: []         # Optional exact approved reference ids; never inferred from suggestions
 acceptance: []        # acceptance criteria ids, e.g. [AC-06]
 area: api             # see .opencode/taskflow.jsonc task.areas
 size: S               # S | M  (one agent session, ~300-500 changed lines max)

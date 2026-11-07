@@ -11,6 +11,9 @@ export interface Rule {
 /** Permission names of the tf_* tools (tool `options.permission`); rules with `resource: "*"` hide them per role. */
 export const TOOL_PERMISSION = { read: "taskflow.read", write: "taskflow.write", dispatch: "taskflow.dispatch" } as const
 
+/** Process artifacts always require the planner/human gate, independent of project protected overrides. */
+export const protectedPaths = (cfg: TaskflowConfig): string[] => [...cfg.protected, cfg.standards.index, "docs/standards/**", "docs/plans/**"]
+
 /** Where the repository lives, so absolute edit paths can be matched too. */
 export interface RepoLayout {
   base: string
@@ -95,7 +98,7 @@ export function roleRules(cfg: TaskflowConfig, role: Role, layout: RepoLayout): 
     ...(write ? [] : [deny(TOOL_PERMISSION.write, "*")]),
     ...(dispatch ? [] : [deny(TOOL_PERMISSION.dispatch, "*")]),
   ]
-  const protectedEdit = cfg.protected.flatMap(everywhere).map((r) => deny("edit", r))
+  const protectedEdit = protectedPaths(cfg).flatMap(everywhere).map((r) => deny("edit", r))
   switch (role) {
     case "implementer":
       return [...common, ...noMerge, ...protectedEdit, ...tools(true, false)]
@@ -106,7 +109,7 @@ export function roleRules(cfg: TaskflowConfig, role: Role, layout: RepoLayout): 
         ...common,
         ...noMerge,
         deny("edit", "*"),
-        ...[`${cfg.paths.tasks}/**`, `${cfg.paths.epics}/**`, "docs/**", ...cfg.protected].map((g) => allow("edit", toWildcard(g))),
+        ...[`${cfg.paths.tasks}/**`, `${cfg.paths.epics}/**`, "docs/**", ...protectedPaths(cfg)].map((g) => allow("edit", toWildcard(g))),
         ...tools(true, false),
       ]
     case "lead":
@@ -367,8 +370,8 @@ export function guard(cfg: TaskflowConfig, ev: GuardEvent, ctx: GuardContext): s
   const role = ROLES.find((r) => agentName(cfg, r) === ev.agent)
   if (!role) return null
   if (ev.action === "edit" && role !== "planner") {
-    const hit = ev.resources.map((r) => relativize(r, ctx.roots, ctx.worktreeParent)).find((r) => matchesAny(r, cfg.protected))
-    if (hit) return `taskflow: ${hit} is a protected path (${cfg.protected.join(", ")}); only the planner changes it, through a PR a human merges`
+    const hit = ev.resources.map((r) => relativize(r, ctx.roots, ctx.worktreeParent)).find((r) => matchesAny(r, protectedPaths(cfg)))
+    if (hit) return `taskflow: ${hit} is a protected path (${protectedPaths(cfg).join(", ")}); only the planner changes it, through a PR a human merges`
   }
   if (ev.action === "shell") {
     for (const cmd of ev.resources) {

@@ -8,6 +8,7 @@ import { TOOL_PERMISSION, type RepoLayout } from "./core/guard.ts"
 import { init } from "./core/init.ts"
 import { formatModelRef, resolveChain, routeCategory, type AvailableModel, type ModelRef } from "./core/models.ts"
 import { check, info, loadTasks, loadTasksFromRef, notReadyReason, readyTasks, setStatus, summary, writeBoard, type Doc } from "./core/tasks.ts"
+import { loadStandards, readStandardsIndex, standardIds, suggestStandards } from "./core/standards.ts"
 
 /** What the tools need from the plugin host; injected so the tools are testable without OpenCode. */
 export interface ToolHost {
@@ -43,6 +44,7 @@ export interface DispatchResult {
   text: string
   outcome: string | null
   error: string | null
+  standards?: Array<{ id: string; path: string; sha256: string }>
 }
 
 export interface ToolCallContext {
@@ -141,6 +143,29 @@ export function buildTools(host: ToolHost): ToolDef[] {
 
   return [
     {
+      name: "tf_standards",
+      permission: TOOL_PERMISSION.read,
+      description: "Read the session repository's reference index: list, deterministic suggest (not selection), explicitly load ids, or check all references. Approved only by default. Drafts require includeDrafts for human review and are never available to workers. Status is a routing hint, not authenticated sign-off. No arbitrary paths or network reads.",
+      input: obj({ operation: { type: "string", enum: ["list", "suggest", "load", "check"] }, ids: { type: "array", items: { type: "string" } }, area: str("Area for relevance suggestions"), tags: { type: "array", items: { type: "string" } }, query: str("Relevance query; does not select or approve entries"), includeDrafts: bool("Explicitly show/load drafts for human review only; unavailable to workers") }, ["operation"]),
+      async execute(input, ctx) {
+        try {
+          const cfg = cfgNow()
+          const root = await host.sessionRoot(ctx.sessionID)
+          const worker = (["implementer", "reviewer", "qa"] as Role[]).some((r) => ctx.agent === agentName(cfg, r))
+          if (input.includeDrafts && worker) throw new Error("draft standards are for human/planner review, not worker context")
+          if (!["list", "suggest", "load", "check"].includes(input.operation)) throw new Error("operation must be list, suggest, load or check")
+          if (input.operation === "load") return loadStandards(root, cfg, standardIds(input.ids), input.includeDrafts === true).text
+          const index = readStandardsIndex(root, cfg)
+          if (!index) return `Standards index missing: ${cfg.standards.index}. Optional until ids are selected; no standards loaded.`
+          const entries = input.operation === "suggest" ? suggestStandards(index, input) : index.entries.filter((e) => e.status === "approved" || input.includeDrafts === true)
+          if (input.operation === "check") {
+            for (const e of entries) loadStandards(root, cfg, [e.id], input.includeDrafts === true)
+          }
+          return JSON.stringify({ index: cfg.standards.index, notice: "Project reference data subordinate to AGENTS/spec/ADR and guard. Status is a routing hint, NOT authenticated human sign-off. Suggestions do not select entries.", operation: input.operation, entries }, null, 2)
+        } catch (e) { return `ERROR: ${(e as Error).message}` }
+      },
+    },
+    {
       name: "tf_status",
       permission: TOOL_PERMISSION.read,
       description: "Taskflow status of this session's worktree: counters per status and epic, ready tasks (as merged on the base branch), tasks in progress/blocked, board freshness, task-file problems; with gh=true also open PRs and recent CI runs.",
@@ -216,6 +241,7 @@ export function buildTools(host: ToolHost): ToolDef[] {
           `${i.id} ${i.title}`,
           `status ${i.status} · epic ${i.epic} · ${i.area}/${i.size} · depends ${i.depends.join(", ") || "-"} · blocked_by ${i.blocked_by.join(", ") || "-"}`,
           `spec ${i.spec.join(", ") || "-"} · acceptance ${i.acceptance.join(", ") || "-"} · branch ${i.branch ?? "-"} · pr ${i.pr ?? "-"}`,
+          `standards (explicit ids): ${i.standards.join(", ") || "none"}`,
           i.status === "todo" ? `ready: ${why ? `no (${why})` : "yes"}` : "",
           wt ? `worktree: ${wt}` : "",
           `file: ${path.join(root, i.file)}`,
@@ -287,7 +313,7 @@ export function buildTools(host: ToolHost): ToolDef[] {
     {
       name: "tf_check",
       permission: TOOL_PERMISSION.read,
-      description: "Validate epics and tasks in this session's worktree (or `directory`): fields and enums, unique ids, file names, known epics/depends/spec ids, no cycles, done => pr + all DoD ticked + Result, in_progress => branch, id collisions with the base branch. gh=true also warns when a done task's PR is not merged.",
+      description: "Validate epics and tasks in this session's worktree (or `directory`): fields and enums, unique ids, file names, known epics/depends/spec ids, optional explicit approved standards bindings and their bounded sources, no cycles, done => pr + all DoD ticked + Result, in_progress => branch, id collisions with the base branch. gh=true also warns when a done task's PR is not merged.",
       input: obj({ gh: bool("Also check PR states with gh"), directory: str("Worktree to check (default: this session's)") }),
       async execute(input, ctx) {
         const root = await where(input, ctx)
@@ -362,7 +388,7 @@ export function buildTools(host: ToolHost): ToolDef[] {
     {
       name: "tf_dispatch",
       permission: TOOL_PERMISSION.dispatch,
-      description: "Run a role agent (planner|implementer|reviewer|qa) as a child session and wait for its final answer. For the implementer pass `task` (its worktree becomes the working directory and its size/area may route the model). For the planner pass `directory` = its plan worktree (tf_start plan). Pass `sessionID` to continue a previous child (e.g. send review findings back to the same implementer). Returns the child's final message, outcome and errors.",
+      description: "Run a role agent (planner|implementer|reviewer|qa) as a child session and wait for its final answer. Pass `task` to both implementer and reviewer: the exact approved standards binding is loaded from the task worktree before child creation (reviewer still runs from main). The implementer's task size/area may route its model. For planner pass `directory` = its plan worktree (tf_start plan). Pass `sessionID` to continue a child. Returns final message, outcome, errors, selected standards ids/paths/hashes.",
       input: obj(
         {
           role: str("planner | implementer | reviewer | qa"),
@@ -382,6 +408,7 @@ export function buildTools(host: ToolHost): ToolDef[] {
           return [
             `child session: ${r.sessionID}`,
             `agent: ${r.agent} · model: ${r.model ?? "inherited"} · directory: ${r.directory} · outcome: ${r.outcome ?? "unknown"}`,
+            `standards: ${r.standards?.map((s) => `${s.id} -> ${s.path} (sha256 ${s.sha256})`).join("; ") || "none explicitly selected"}`,
             r.error ? `ERROR in child: ${r.error}` : "",
             "",
             r.text || "(no final text)",
@@ -396,7 +423,7 @@ export function buildTools(host: ToolHost): ToolDef[] {
     {
       name: "tf_init",
       permission: TOOL_PERMISSION.write,
-      description: "Scaffold the taskflow process in this repository without overwriting anything: .opencode/taskflow.jsonc (with detected verify/setup commands), task template, epics README and example, PR templates, docs/taskflow.md, AGENTS.md section, task board.",
+      description: "Scaffold the taskflow process in this repository without overwriting anything: .opencode/taskflow.jsonc (with detected verify/setup commands), task template, epics README and example, PR templates, docs/taskflow.md, empty standards reference index and guide, AGENTS.md section, task board. Never invent approved conventions.",
       input: obj({ language: str("Human language code for human-facing texts, e.g. ru or en") }),
       async execute(input, ctx) {
         const root = await host.sessionRoot(ctx.sessionID)

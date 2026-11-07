@@ -72,10 +72,10 @@ assert {'action':'taskflow.dispatch','resource':'*','effect':'deny'} in a['permi
 " || fail "implementer may dispatch"
 ok "implementer cannot dispatch other agents"
 
-for c in tf-next tf-ship tf-review tf-handoff tf-status tf-plan tf-drive tf-milestone tf-init tf-doctor; do
+for c in tf-next tf-ship tf-review tf-handoff tf-status tf-plan tf-discover tf-standards tf-shape tf-drive tf-milestone tf-init tf-doctor; do
   echo "$cmds" | grep -q "\"$c\"" || fail "command $c missing"
 done
-ok "10 commands registered"
+ok "13 commands registered"
 
 if [[ "${LIVE:-}" != "1" ]]; then
   echo "PASS (static). LIVE=1 for the session part. Workdir: $WORK"

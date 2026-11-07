@@ -19,6 +19,7 @@ import { detectBaseBranch, mainCheckout, worktreePaths, worktreeRoot } from "./c
 import { guard, roleRules, type RepoLayout } from "./core/guard.ts"
 import { resolveChain, type AvailableModel } from "./core/models.ts"
 import { info, loadTasks } from "./core/tasks.ts"
+import { taskStandards, type StandardsContext } from "./core/standards.ts"
 import { ROLE_DESCRIPTIONS, roleMode, rolePrompt } from "./roles.ts"
 import { buildTools, childResult, dispatchChain, taskWorktree, type DispatchInput, type DispatchResult } from "./tools.ts"
 
@@ -194,10 +195,13 @@ export default define({
       const cfg = config()
       const agent = agentName(cfg, input.role)
       let task: { size?: string; area?: string } | null = null
+      let standards: StandardsContext = taskStandards(root, cfg, undefined)
       const wt = input.task ? taskWorktree(root, cfg, input.task) : null
       if (input.task) {
         const doc = loadTasks(wt ?? root, cfg).find((d) => asString(d.data?.id) === input.task)
-        if (doc) task = info(doc)
+        if (!doc?.data) throw new Error(`task ${input.task} not found or missing frontmatter in ${wt ?? root}`)
+        task = info(doc)
+        standards = taskStandards(wt ?? root, cfg, doc.data.standards)
       }
       // the reviewer reads the PR through git and never works inside the implementer's worktree
       const directory = input.directory ? path.resolve(mainDir, input.directory) : input.role === "reviewer" ? mainDir : (wt ?? mainDir)
@@ -227,7 +231,7 @@ export default define({
           await ctx.session.interrupt({ sessionID: sid as any } as any).catch(() => {})
           throw new Error("aborted")
         }
-        const header = [input.task ? `Task: ${input.task}` : "", `Working directory: ${directory} (run every shell command there).`].filter(Boolean).join("\n")
+        const header = [input.task ? `Task: ${input.task}` : "", `Working directory: ${directory} (run every shell command there).`, `Standards binding source: ${wt ?? root}`, standards.text].filter(Boolean).join("\n")
         let timedOut = false
         const interrupt = () => void ctx.session.interrupt({ sessionID: sid as any } as any).catch(() => {})
         input.signal.addEventListener("abort", interrupt, { once: true })
@@ -246,7 +250,7 @@ export default define({
         const messages: any = await ctx.session.context({ sessionID: sid as any } as any)
         const r = childResult(Array.isArray(messages) ? messages : (messages?.data ?? []))
         const error = timedOut ? `timed out after ${cfg.dispatch.timeoutMinutes} min and was interrupted${r.error ? `; ${r.error}` : ""}` : input.signal.aborted ? "aborted by the caller" : r.error
-        return { sessionID: sid, agent, model: modelString(model), directory, text: r.text, outcome: r.outcome, error }
+        return { sessionID: sid, agent, model: modelString(model), directory, text: r.text, outcome: r.outcome, error, standards: standards.sources.flatMap((s) => s.ids.map((id) => ({ id, path: s.path, sha256: s.sha256 }))) }
       } finally {
         running.set(input.role, Math.max(0, (running.get(input.role) ?? 1) - 1))
       }

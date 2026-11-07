@@ -3,6 +3,7 @@ import path from "node:path"
 import { taskIdRe, type TaskflowConfig } from "../config.ts"
 import { asList, asString, parseFrontmatter, sectionBody, setField, type Frontmatter } from "./frontmatter.ts"
 import { tryGit } from "./git.ts"
+import { taskStandards } from "./standards.ts"
 
 export const TASK_STATUS = ["todo", "in_progress", "review", "done", "blocked"] as const
 export const EPIC_STATUS = ["planned", "in_progress", "done", "accepted"] as const
@@ -63,6 +64,7 @@ export interface TaskInfo {
   blocked_by: string[]
   spec: string[]
   acceptance: string[]
+  standards: string[]
   branch: string | null
   pr: string | null
   file: string
@@ -81,6 +83,7 @@ export function info(t: Doc): TaskInfo {
     blocked_by: asList(d.blocked_by),
     spec: asList(d.spec),
     acceptance: asList(d.acceptance),
+    standards: asList(d.standards),
     branch: asString(d.branch),
     pr: asString(d.pr),
     file: t.rel,
@@ -200,6 +203,10 @@ export function check(root: string, cfg: TaskflowConfig, opts: CheckOptions = {}
     if (!epicIds.has(asString(d.epic) ?? "")) err(t.rel, `unknown epic "${d.epic}"`)
     for (const k of ["depends", "blocked_by", "spec", "acceptance"]) {
       if (!Array.isArray(d[k])) err(t.rel, `${k} must be a list (use [])`)
+    }
+    if ("standards" in d) {
+      try { taskStandards(root, cfg, d.standards) }
+      catch (e) { err(t.rel, (e as Error).message) }
     }
     if (spec.enabled && cfg.spec?.questions) {
       for (const q of asList(d.blocked_by)) if (!spec.questions.has(q)) err(t.rel, `blocked_by ${q} not found in ${cfg.spec.questions}`)
