@@ -395,7 +395,7 @@ export function buildTools(host: ToolHost): ToolDef[] {
           prompt: str("Complete instructions; the child starts with a fresh context"),
           task: str("Task id this work belongs to"),
           directory: str("Working directory for the child (default: the task's worktree, else the main checkout)"),
-          sessionID: str("Continue this child with its original role/task association (recovered from session metadata). Omitted task reuses it; contradictory task/role/parent/directory is rejected. Unrecoverable legacy sessions require a new child."),
+          sessionID: str("Continue this child with its original role/task and durable task-source identity (v2 session metadata), separately from execution directory. Omitted task reuses it; changed source repository/worktree, task directory/file, role/parent/directory are rejected before prompting. Unrecoverable old metadata requires a new child; contents are refreshed, not snapshotted."),
         },
         ["role", "prompt"],
       ),

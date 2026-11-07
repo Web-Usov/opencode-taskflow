@@ -7,6 +7,7 @@ import type { RepoLayout } from "./guard.ts"
 import { detectBaseBranch, tryGit } from "./git.ts"
 import { writeBoard } from "./tasks.ts"
 import { standardFile } from "./standards.ts"
+import { preflightScaffold } from "./scaffold.ts"
 
 export const TEMPLATES_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../templates")
 
@@ -91,7 +92,14 @@ export function init(root: string, cfg: TaskflowConfig, layout: RepoLayout, opts
     setup: { ...cfg.setup, commands: cfg.setup.commands.length ? cfg.setup.commands : detected.install ? [detected.install] : [] },
   }
 
-  // Validate scaffold destinations before writing; existing index/docs are never replaced.
+  // Every destination, including optional integrations and the generated board, is checked before the FIRST write.
+  preflightScaffold(root, [
+    cfg.paths.config, cfg.paths.template, `${cfg.paths.epics}/README.md`, cfg.paths.epicTemplate,
+    cfg.paths.prTemplate, cfg.paths.humanReviewTemplate, cfg.paths.workflow, cfg.standards.index,
+    cfg.paths.standardsGuide, cfg.paths.board,
+    ...(opts.agentsLink ? ["AGENTS.md"] : []),
+    ...(opts.githubTemplate && cfg.paths.humanReviewTemplate !== ".github/PULL_REQUEST_TEMPLATE/human-review.md" ? [".github/PULL_REQUEST_TEMPLATE/human-review.md"] : []),
+  ], [cfg.paths.tasks])
   standardFile(root, cfg.standards.index, cfg)
   standardFile(root, cfg.paths.standardsGuide, { ...cfg, standards: { ...cfg.standards, roots: [...cfg.standards.roots, path.posix.dirname(cfg.paths.standardsGuide)] } })
 
@@ -125,7 +133,8 @@ export function init(root: string, cfg: TaskflowConfig, layout: RepoLayout, opts
     created.push("AGENTS.md (workflow section appended)")
   } else if (opts.agentsLink) skipped.push("AGENTS.md")
 
-  const board = writeBoard(root, cfg)
-  if (board.written) created.push(cfg.paths.board)
+  // Init is non-overwriting even for an existing board; tf_board is the explicit regeneration action.
+  if (fs.existsSync(path.join(root, cfg.paths.board))) skipped.push(cfg.paths.board)
+  else if (writeBoard(root, cfg).written) created.push(cfg.paths.board)
   return { created, skipped, detected }
 }

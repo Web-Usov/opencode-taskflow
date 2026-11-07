@@ -7,6 +7,11 @@
   without automatic moves. Init no longer creates a live sample epic or touches AGENTS/GitHub without explicit opt-in.
 - Config/workflow detection stays consistent; central standards reads retain hidden-path and symlink confinement.
   Planner/human protections cover effective metadata paths while task updates remain available to implementers.
+- Scaffold preflights every destination before writing, rejecting traversal, escaping symlinks, incompatible types
+  and collisions without partial output. Durable dispatch metadata v2 binds task source identity independently of
+  child execution location; source-root/file substitutions fail closed while ordinary content refresh stays supported.
+- Ownership-signature changes invalidate running-host config caches; existing legacy GitHub checklists remain selected
+  read-only without re-init, unless explicitly overridden.
 - Reference-only standards index and optional task `standards` bindings. Existing tasks and finance board output remain
   compatible; no index is required until a task explicitly selects standards.
 - Read-only `tf_standards` tool: list, deterministic suggestions, explicit bounded loading and validation. Source paths

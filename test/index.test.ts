@@ -189,6 +189,163 @@ describe("standards dispatch integration (no live models)", () => {
   })
 })
 
+describe("durable task SOURCE identity regressions", () => {
+  for (const role of ["implementer", "reviewer"]) for (const reload of [false, true]) {
+    for (const attack of ["tasks path", "worktree move", "worktree selection", "task file rename", "directory replacement", "directory symlink", "task file symlink", "symlink alias path"]) {
+      test(`${role} rejects changed ${attack}, reload=${reload}`, async () => {
+        const h = await boot({}, true)
+        let active = h
+        let cleanup = h.cleanup
+        try {
+          const wt = path.join(h.dir, "source-worktree")
+          sh("git", ["worktree", "add", "-q", "-b", "task/T-001-bound", wt], h.main)
+          const context = { sessionID: "ses_parent", agent: "lead", signal: new AbortController().signal }
+          const tool = () => active.tools.find((t) => t.name === "tf_dispatch")
+          const created = await tool().execute({ role, task: "T-001", prompt: "original" }, context)
+          const sessionID = created.content.match(/child session: (\S+)/)![1]
+          expect(h.sessions.get(sessionID).location.directory).toBe(role === "reviewer" ? h.main : wt)
+          const tasks = path.join(wt, ".taskflow/tasks")
+          if (attack === "tasks path") {
+            write(wt, "replacement-tasks/T-001-other.md", taskFile({ id: "T-001", title: "REPLACEMENT TASK" }))
+            write(h.main, ".taskflow/config.jsonc", JSON.stringify({ paths: { tasks: "replacement-tasks" } }))
+          } else if (attack === "worktree move") {
+            sh("git", ["worktree", "move", wt, wt + "-moved"], h.main)
+          } else if (attack === "worktree selection") {
+            sh("git", ["branch", "-m", "unrelated"], wt)
+          } else if (attack === "task file rename") {
+            fs.renameSync(path.join(tasks, "T-001-first-task.md"), path.join(tasks, "T-001-renamed.md"))
+          } else if (attack === "directory symlink") {
+            fs.renameSync(tasks, tasks + "-old")
+            fs.symlinkSync("tasks-old", tasks)
+          } else if (attack === "directory replacement") {
+            fs.renameSync(tasks, tasks + "-old")
+            fs.cpSync(tasks + "-old", tasks, { recursive: true })
+          } else if (attack === "task file symlink") {
+            const file = path.join(tasks, "T-001-first-task.md")
+            fs.renameSync(file, file + ".old")
+            fs.symlinkSync(file + ".old", file)
+          } else {
+            fs.symlinkSync("tasks", path.join(wt, ".taskflow/alias"))
+            write(h.main, ".taskflow/config.jsonc", JSON.stringify({ paths: { tasks: ".taskflow/alias" } }))
+          }
+          if (reload) {
+            cleanup()
+            const f = fakeCtx(h.main, h.sessions)
+            cleanup = await (await import("../src/index.ts")).default.setup(f.ctx)
+            f.replay()
+            active = { ...h, ...f }
+          }
+          const before = active.calls.filter((c) => c.fn === "session.prompt").length
+          const result = await tool().execute({ role, sessionID, prompt: "must not switch source" }, context)
+          expect(result.content).toContain("ERROR")
+          expect(active.calls.filter((c) => c.fn === "session.prompt")).toHaveLength(before)
+        } finally { cleanup() }
+      }, T)
+    }
+
+    test(`${role} refreshes same source contents, with v2 source metadata; reload=${reload}`, async () => {
+      const h = await boot({}, true)
+      let active = h
+      let cleanup = h.cleanup
+      try {
+        const wt = path.join(h.dir, "source-worktree")
+        sh("git", ["worktree", "add", "-q", "-b", "task/T-001-bound", wt], h.main)
+        const file = ".taskflow/tasks/T-001-first-task.md"
+        write(wt, file, taskFile({ id: "T-001" }).replace("spec: []", "spec: []\nstandards: [chosen]"))
+        write(wt, ".taskflow/standards/index.json", JSON.stringify({ version: 1, entries: [{ id: "chosen", title: "Chosen", path: ".taskflow/standards/rules.md", status: "approved" }] }))
+        write(wt, ".taskflow/standards/rules.md", "BEFORE REFRESH")
+        const context = { sessionID: "ses_parent", agent: "lead", signal: new AbortController().signal }
+        const created = await active.tools.find((t) => t.name === "tf_dispatch").execute({ role, task: "T-001", prompt: "original" }, context)
+        const sessionID = created.content.match(/child session: (\S+)/)![1]
+        const binding = h.sessions.get(sessionID).metadata.taskflowDispatch
+        expect(binding.version).toBe(2)
+        expect(binding.taskSource.root).toBe(fs.realpathSync(wt))
+        expect(binding.taskSource.file).toBe(fs.realpathSync(path.join(wt, file)))
+        // Atomic editor replacement at the SAME file path remains valid: identity is not a content/inode snapshot.
+        write(wt, "new-task.md", taskFile({ id: "T-001", title: "Updated same task" }).replace("spec: []", "spec: []\nstandards: [chosen]"))
+        fs.renameSync(path.join(wt, "new-task.md"), path.join(wt, file))
+        write(wt, ".taskflow/standards/rules.md", "AFTER REFRESH")
+        if (reload) {
+          cleanup()
+          // Durable JSON metadata is an object, not a key-order-sensitive byte encoding.
+          h.sessions.get(sessionID).metadata.taskflowDispatch.taskSource = Object.fromEntries(Object.entries(binding.taskSource).reverse())
+          const f = fakeCtx(h.main, h.sessions)
+          cleanup = await (await import("../src/index.ts")).default.setup(f.ctx)
+          f.replay()
+          active = { ...h, ...f }
+        }
+        const result = await active.tools.find((t) => t.name === "tf_dispatch").execute({ role, sessionID, prompt: "refresh" }, context)
+        expect(result.content).not.toContain("ERROR")
+        expect(active.calls.filter((c) => c.fn === "session.prompt").at(-1)!.arg.text).toContain("AFTER REFRESH")
+        // V1 metadata does not contain a recoverable source association.
+        h.sessions.get(sessionID).metadata.taskflowDispatch = { ...binding, version: 1 }
+        const before = active.calls.filter((c) => c.fn === "session.prompt").length
+        expect((await active.tools.find((t) => t.name === "tf_dispatch").execute({ role, sessionID, prompt: "old metadata" }, context)).content).toContain("ERROR")
+        expect(active.calls.filter((c) => c.fn === "session.prompt")).toHaveLength(before)
+      } finally { cleanup() }
+    }, T)
+  }
+})
+
+describe("running host discovers ownership signature changes", () => {
+  for (const signature of ["workflow", "finance"]) for (const remove of [false, true]) test(`${signature}, remove=${remove}`, async () => {
+    const repo = repoWithOrigin({ "README.md": "app" })
+    const add = () => {
+      if (signature === "workflow") write(repo.main, "docs/taskflow.md", "Generated by opencode-taskflow")
+      else {
+        write(repo.main, "tasks/README.md", "Generated by scripts/tasks.mjs board")
+        write(repo.main, "scripts/tasks.mjs", "// legacy")
+        write(repo.main, "tasks/_template.md", TEMPLATE)
+      }
+    }
+    if (remove) add()
+    const f = fakeCtx(repo.main)
+    const cleanup: any = await (await import("../src/index.ts")).default.setup(f.ctx)
+    f.replay()
+    try {
+      if (!remove) add()
+      else if (signature === "workflow") fs.unlinkSync(path.join(repo.main, "docs/taskflow.md"))
+      else fs.unlinkSync(path.join(repo.main, "scripts/tasks.mjs"))
+      const ctx = { sessionID: "ses_parent", signal: new AbortController().signal }
+      await f.tools.find((t) => t.name === "tf_init").execute({}, ctx)
+      expect(fs.existsSync(path.join(repo.main, remove ? ".taskflow/config.jsonc" : ".opencode/taskflow.jsonc"))).toBe(true)
+      expect(fs.existsSync(path.join(repo.main, remove ? ".opencode/taskflow.jsonc" : ".taskflow/config.jsonc"))).toBe(false)
+    } finally { cleanup() }
+  }, T)
+
+  test("ownership content changes invalidate cache even when mtime is unchanged", async () => {
+    const repo = repoWithOrigin({ "README.md": "app", "docs/taskflow.md": "unrelated user document" })
+    const file = path.join(repo.main, "docs/taskflow.md")
+    const f = fakeCtx(repo.main)
+    const cleanup: any = await (await import("../src/index.ts")).default.setup(f.ctx)
+    f.replay()
+    try {
+      const stat = fs.statSync(file)
+      fs.writeFileSync(file, "Generated by opencode-taskflow")
+      fs.utimesSync(file, stat.atime, stat.mtime)
+      await f.tools.find((t) => t.name === "tf_init").execute({}, { sessionID: "ses_parent", signal: new AbortController().signal })
+      expect(fs.existsSync(path.join(repo.main, ".opencode/taskflow.jsonc"))).toBe(true)
+      expect(fs.existsSync(path.join(repo.main, ".taskflow"))).toBe(false)
+    } finally { cleanup() }
+  }, T)
+
+  test("running legacy host refreshes existence-aware ship fallback without init", async () => {
+    const h = await boot()
+    try {
+      write(h.main, ".github/pull_request_template.md", "CUSTOM AGENT")
+      write(h.main, ".github/PULL_REQUEST_TEMPLATE/human-review.md", "CUSTOM HUMAN")
+      await h.tools.find((t) => t.name === "tf_models").execute({}, { sessionID: "ses_parent", signal: new AbortController().signal })
+      h.replay()
+      await h.commands.find((c) => c.name === "tf-ship").execute({ sessionID: "ses_parent", prompt: { text: "" }, delivery: undefined })
+      const prompt = h.calls.filter((c) => c.fn === "session.prompt").at(-1)!.arg.text
+      expect(prompt).toContain(".github/pull_request_template.md")
+      expect(prompt).toContain(".github/PULL_REQUEST_TEMPLATE/human-review.md")
+      expect(fs.readFileSync(path.join(h.main, ".github/pull_request_template.md"), "utf8")).toBe("CUSTOM AGENT")
+      expect(fs.readFileSync(path.join(h.main, ".github/PULL_REQUEST_TEMPLATE/human-review.md"), "utf8")).toBe("CUSTOM HUMAN")
+    } finally { h.cleanup() }
+  }, T)
+})
+
 function makeRepo(central = false) {
   const files = {
     ".opencode/taskflow.jsonc": CONFIG,

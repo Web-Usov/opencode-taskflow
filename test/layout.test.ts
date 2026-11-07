@@ -62,6 +62,35 @@ test("discovery precedence does not merge legacy project settings; stamps observ
   expect(load(root, global).config.parallel).toBe(8)
 })
 
+test("legacy ship selects both existing custom GitHub checklists without init; explicit overrides win", () => {
+  const root = tmpdir()
+  write(root, ".opencode/taskflow.jsonc", "{}")
+  const agent = ".github/pull_request_template.md"
+  const human = ".github/PULL_REQUEST_TEMPLATE/human-review.md"
+  write(root, agent, "CUSTOM AGENT CHECKLIST")
+  write(root, human, "CUSTOM HUMAN CHECKLIST")
+  const c = load(root).config
+  expect(c.paths.prTemplate).toBe(agent)
+  expect(c.paths.humanReviewTemplate).toBe(human)
+  const ship = commandSpecs(c, layout(root)).find((s) => s.name === "tf-ship")!.render("")
+  expect(ship).toContain(agent)
+  expect(ship).toContain(human)
+  expect(fs.readFileSync(path.join(root, agent), "utf8")).toBe("CUSTOM AGENT CHECKLIST")
+  expect(fs.readFileSync(path.join(root, human), "utf8")).toBe("CUSTOM HUMAN CHECKLIST")
+  expect(fs.existsSync(path.join(root, "docs"))).toBe(false)
+  write(root, ".opencode/taskflow.jsonc", JSON.stringify({ paths: { prTemplate: "custom/agent.md", humanReviewTemplate: "custom/human.md" } }))
+  const explicit = load(root).config
+  expect(explicit.paths.prTemplate).toBe("custom/agent.md")
+  expect(explicit.paths.humanReviewTemplate).toBe("custom/human.md")
+  write(root, ".opencode/taskflow.jsonc", "{}")
+  write(root, "global.jsonc", JSON.stringify({ paths: { prTemplate: "global/agent.md", humanReviewTemplate: "global/human.md" } }))
+  expect(load(root, path.join(root, "global.jsonc")).config.paths.prTemplate).toBe("global/agent.md")
+  expect(loadConfig(root, { paths: { humanReviewTemplate: "options/human.md" } }, path.join(root, "global.jsonc")).config.paths.humanReviewTemplate).toBe("options/human.md")
+  // Central layout never adopts GitHub templates just because they exist.
+  write(root, ".taskflow/config.jsonc", "{}")
+  expect(load(root).config.paths.prTemplate).toBe(".taskflow/templates/pull-request.md")
+})
+
 test("arbitrary tasks/epics are not ownership; strong legacy signature and explicit global legacy paths retain old layout", () => {
   const root = tmpdir()
   write(root, "tasks/README.md", "Unrelated product tasks")

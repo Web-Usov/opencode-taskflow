@@ -232,10 +232,14 @@ export function projectConfigPath(root: string): string {
 }
 
 /** Directory names alone are not evidence of ownership. */
-export function hasLegacyLayout(root: string): boolean {
+function legacyLayoutSignature(root: string): [boolean, boolean, boolean, boolean] {
   const read = (rel: string) => { try { return fs.readFileSync(path.join(root, rel), "utf8") } catch { return "" } }
-  return /opencode-taskflow/.test(read("docs/taskflow.md")) ||
-    (/scripts\/tasks\.mjs/.test(read("tasks/README.md")) && fs.existsSync(path.join(root, "scripts/tasks.mjs")) && fs.existsSync(path.join(root, "tasks/_template.md")))
+  return [/opencode-taskflow/.test(read("docs/taskflow.md")), /scripts\/tasks\.mjs/.test(read("tasks/README.md")), fs.existsSync(path.join(root, "scripts/tasks.mjs")), fs.existsSync(path.join(root, "tasks/_template.md"))]
+}
+
+export function hasLegacyLayout(root: string): boolean {
+  const [workflow, board, script, template] = legacyLayoutSignature(root)
+  return workflow || (board && script && template)
 }
 
 function readLayer(file: string, sources: ConfigSource[]): unknown {
@@ -269,6 +273,13 @@ export function loadConfig(root: string, options: unknown = undefined, globalPat
     if (typeof lang === "string") human = lang
   }
   const defaults = defaultConfig(human, legacy)
+  // Upgrade compatibility is read-only: prefer existing customized legacy checklists without requiring init.
+  // Applying this to defaults BEFORE layers ensures every explicit global/project/options override still wins.
+  if (legacy) {
+    const existing = (rel: string) => { try { return fs.statSync(path.join(root, rel)).isFile() } catch { return false } }
+    if (existing(".github/pull_request_template.md")) defaults.paths.prTemplate = ".github/pull_request_template.md"
+    if (existing(".github/PULL_REQUEST_TEMPLATE/human-review.md")) defaults.paths.humanReviewTemplate = ".github/PULL_REQUEST_TEMPLATE/human-review.md"
+  }
   let config = defaults
   for (const l of layers) {
     config = deepMerge(config, l)
@@ -393,7 +404,8 @@ export const taskIdRe = (cfg: TaskflowConfig) => new RegExp(`^T-\\d{${cfg.task.i
 
 /** mtime fingerprint of the config files, to re-read them only when they change. */
 export function configStamp(root: string, globalPath = globalConfigPath()): string {
-  return [globalPath, path.join(root, ".taskflow/config.jsonc"), path.join(root, ".opencode/taskflow.jsonc")]
+  const candidates = [path.join(root, ".taskflow/config.jsonc"), path.join(root, ".opencode/taskflow.jsonc")]
+  const files = [globalPath, ...candidates]
     .map((f) => {
       try {
         return String(fs.statSync(f).mtimeMs)
@@ -402,6 +414,11 @@ export function configStamp(root: string, globalPath = globalConfigPath()): stri
       }
     })
     .join("|")
+  // Discovery and invalidation use exactly the same ownership predicates, even for same-mtime content changes.
+  const templates = [".github/pull_request_template.md", ".github/PULL_REQUEST_TEMPLATE/human-review.md"].map((rel) => {
+    try { return fs.statSync(path.join(root, rel)).isFile() } catch { return false }
+  })
+  return files + "|" + (candidates.some((f) => fs.existsSync(f)) ? "configured" : JSON.stringify(legacyLayoutSignature(root))) + "|" + JSON.stringify(templates)
 }
 
 export function agentName(config: TaskflowConfig, role: Role): string {
