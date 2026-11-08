@@ -49,6 +49,11 @@ colliding or reassigned identities before the inner current-config guard, includ
 Config diagnostics are sanitized at the loader (read/parse/validation class, paths, safe field names) and again at caller
 gates; raw JSON fragments/invalid values/regex text/category keys never enter configuration error output.
 
+Permission-hook foreign classification requires actual host session evidence, not only current registration history.
+Either owned metadata key's presence (even invalid/conflicting) routes to the central caller/bound-identity validator shared
+with tools and commands. Lookup failures or unavailable identity cannot prove foreign status; confirmed matching unbound
+foreign sessions remain unaffected. This preserves pure-renamed native v1/standalone v2 children across plugin reload.
+
 Mode is explicit backend config or read-only ownership discovery: existing Taskflow config/signatures retain standalone;
 all other projects expect OpenSpec and diagnose missing dependencies without scaffold. Registration never calls OpenSpec
 or scans repository trees. Taskflow commands keep the tf prefix and never replace native opsx commands/skills.

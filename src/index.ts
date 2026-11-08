@@ -221,25 +221,29 @@ export default define({
         return caller
       } catch (error) { throw new Error(`caller policy unavailable/differs: ${(error as Error).message}. Open/reload the plugin in the calling worktree (${caller}) before using Taskflow; no operation was started.`) }
     }
-    const assertCallerPolicy = async (sessionID: string): Promise<string> => {
-      let directory: unknown
-      let sessionAgent: unknown
-      let boundRole: unknown
-      let boundAgent: unknown
-      let hasRoleBinding = false
+    // Ownership presence is not successful parsing: null/invalid/conflicting plugin keys must never route as foreign.
+    const hasChildBinding = (session: any): boolean => ["taskflowOpenSpecDispatch", "taskflowDispatch"].some((key) => Object.prototype.hasOwnProperty.call(session?.metadata ?? {}, key))
+    const readCallerSession = async (sessionID: string): Promise<any> => {
+      let session: any
       try {
         const response: any = await ctx.session.get({ sessionID: sessionID as any })
-        const session = response?.data ?? response
-        directory = session?.location?.directory
-        sessionAgent = session?.agent
-        const binding = session?.metadata?.taskflowOpenSpecDispatch ?? session?.metadata?.taskflowDispatch
-        hasRoleBinding = binding !== undefined
-        boundRole = binding?.role; boundAgent = binding?.agent
-      } catch { /* no location means no authorization to use the setup root */ }
+        session = response?.data ?? response
+      } catch { /* failed lookup cannot prove a session is unbound/foreign */ }
+      if (!session || typeof session !== "object" || Array.isArray(session) || session.id !== sessionID || (session.metadata !== undefined && (!session.metadata || typeof session.metadata !== "object" || Array.isArray(session.metadata)))) throw new Error("caller policy unavailable: missing, invalid or conflicting host session evidence; reload/open the actual session before retrying")
+      return session
+    }
+    const assertCallerPolicy = async (sessionID: string, evidence?: any): Promise<string> => {
+      const session = evidence ?? await readCallerSession(sessionID)
+      const directory = session.location?.directory, sessionAgent = session.agent
+      const hasRoleBinding = hasChildBinding(session)
+      const native = Object.prototype.hasOwnProperty.call(session.metadata ?? {}, "taskflowOpenSpecDispatch")
+      const legacy = Object.prototype.hasOwnProperty.call(session.metadata ?? {}, "taskflowDispatch")
+      const binding = native ? session.metadata.taskflowOpenSpecDispatch : session.metadata?.taskflowDispatch
+      if (hasRoleBinding && (native === legacy || !binding || typeof binding !== "object" || Array.isArray(binding) || binding.version !== (native ? 1 : 2) || !ROLES.includes(binding.role) || binding.role === "lead" || typeof binding.agent !== "string" || !binding.agent)) throw new Error("taskflow: invalid or conflicting bound agent identity; start a safely configured new role session")
       if (typeof directory !== "string" || !path.isAbsolute(directory)) throw new Error("caller policy unavailable: host did not return the calling session location; reload/open the session in its actual worktree before retrying")
       if (hasRoleBinding && typeof sessionAgent !== "string") throw new Error("taskflow: bound agent identity unavailable; reload/open a safely configured role session before continuing")
       if (typeof sessionAgent === "string") {
-        if (hasRoleBinding && (typeof boundRole !== "string" || !ROLES.includes(boundRole as Role) || boundAgent !== sessionAgent || agentName(config(), boundRole as Role) !== sessionAgent)) throw new Error("taskflow: stale bound agent identity; start a safely configured new role session rather than reassigning an existing child")
+        if (hasRoleBinding && (binding.agent !== sessionAgent || agentName(config(), binding.role as Role) !== sessionAgent)) throw new Error("taskflow: stale bound agent identity; start a safely configured new role session rather than reassigning an existing child")
         const problem = agentIdentityProblem(sessionAgent, config())
         if (problem) throw new Error(problem)
       }
@@ -459,10 +463,12 @@ export default define({
       if (ev.effect === "deny" || (ev.action !== "edit" && ev.action !== "shell")) return
       syncRegistrations()
       const cfg = loaded.config
-      if (!registeredRoles.has(String(ev.agent)) && !ROLES.some((r) => agentName(cfg, r) === String(ev.agent))) return
-      if (setupDirectory !== root) { ev.effect = "deny"; ev.message = "caller policy unavailable: nested plugin setup is unsupported; open/reload at the exact Git worktree root"; return }
-      const identityProblem = agentIdentityProblem(String(ev.agent), cfg)
-      if (identityProblem) { ev.effect = "deny"; ev.message = identityProblem; return }
+      const knownRole = registeredRoles.has(String(ev.agent)) || ROLES.some((r) => agentName(cfg, r) === String(ev.agent))
+      if (knownRole) {
+        if (setupDirectory !== root) { ev.effect = "deny"; ev.message = "caller policy unavailable: nested plugin setup is unsupported; open/reload at the exact Git worktree root"; return }
+        const identityProblem = agentIdentityProblem(String(ev.agent), cfg)
+        if (identityProblem) { ev.effect = "deny"; ev.message = identityProblem; return }
+      }
       if (Date.now() - rootsAt > 10_000) {
         roots = worktreePaths(root)
         rootsAt = Date.now()
@@ -471,13 +477,23 @@ export default define({
       try {
         lay = layout()
       } catch {
+        ev.effect = "deny"
+        ev.message = "caller policy unavailable: repository layout could not be established"
         return
       }
       const evaluate = (executionRoot?: string) => {
         const reason = guard(cfg, { agent: ev.agent ? String(ev.agent) : undefined, action: ev.action, resources: ev.resources }, { base: lay.base, roots: roots.length ? roots : [root], worktreeParent: lay.worktreeParent, executionRoot })
         if (reason) { ev.effect = "deny"; ev.message = reason }
       }
-      if (ev.sessionID) return assertCallerPolicy(String(ev.sessionID)).then(evaluate).catch((error) => { ev.effect = "deny"; ev.message = (error as Error).message })
+      if (ev.sessionID) return readCallerSession(String(ev.sessionID)).then(async (session) => {
+        if (!knownRole && !hasChildBinding(session)) {
+          if (typeof session.agent === "string" && session.agent && session.agent === String(ev.agent) && typeof session.location?.directory === "string" && path.isAbsolute(session.location.directory)) return // positively unbound foreign user agent
+          throw new Error("caller policy unavailable: cannot establish an unbound foreign agent identity from host session evidence")
+        }
+        if (typeof session.agent === "string" && session.agent !== String(ev.agent)) throw new Error("taskflow: conflicting event/session agent identity; reload the actual role session")
+        evaluate(await assertCallerPolicy(String(ev.sessionID), session))
+      }).catch((error) => { ev.effect = "deny"; ev.message = (error as Error).message })
+      if (!knownRole) { ev.effect = "deny"; ev.message = "caller policy unavailable: no session evidence to establish that this agent is unbound/foreign"; return }
       if (cfg.backend === "openspec") { ev.effect = "deny"; ev.message = "caller policy unavailable: permission event has no session location; reload in the calling worktree"; return }
       evaluate()
     })

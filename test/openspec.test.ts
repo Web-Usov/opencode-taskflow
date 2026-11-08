@@ -76,6 +76,71 @@ async function bootPlugin(h: ReturnType<typeof fixture>, options: any = h.cfg, d
 }
 
 describe("review regressions at registered plugin boundaries", () => {
+  const publishedCLI = process.env.OPENSPEC_TEST_EXECUTABLE ?? "/tmp/opencode/openspec-compat-research/install/node_modules/.bin/openspec"
+  for (const backend of ["openspec", "standalone"] as const) test.skipIf(backend === "openspec" && !fs.existsSync(publishedCLI))(`${backend}: actual dispatched child remains permission-guarded after pure rename and fresh-host JSON reload`, async () => {
+    const h = fixture(); h.cfg.backend = backend
+    if (backend === "openspec") h.cfg.openspec.executable = publishedCLI
+    write(h.main, ".taskflow/config.jsonc", JSON.stringify(h.cfg))
+    write(h.main, "openspec/changes/demo/proposal.md", "# Why\nExercise durable child permission identity.\n\n# What Changes\nAdd guard regression tests.\n")
+    sh("git", ["add", "-A"], h.main); sh("git", ["commit", "-qm", "committed child guard policy"], h.main)
+    const old = await bootPlugin(h, null)
+    let child: any
+    const metadataKey = backend === "openspec" ? "taskflowOpenSpecDispatch" : "taskflowDispatch"
+    const commands = ["git -c foo=bar push origin HEAD:main", "env X=1 bash -c 'git -c foo=bar push origin HEAD:main'", "command git -c foo=bar push --force origin HEAD"]
+    try {
+      if (backend === "openspec") expect((await old.call("tf_openspec", { operation: "start", change: "demo", confirm: true })).content).toContain('"phase": "claimed"')
+      expect((await old.call("tf_dispatch", { role: "implementer", ...(backend === "openspec" ? { change: "demo" } : {}), prompt: "Create the actual bound test child; no model is executed by the fake host" })).content).toContain("child session")
+      child = JSON.parse(JSON.stringify(old.creates[0]))
+      expect(child.metadata[metadataKey].version).toBe(backend === "openspec" ? 1 : 2)
+      const before = { agent: child.agent, sessionID: child.id, action: "shell", resources: [commands[0]!], effect: "allow" }
+      await old.hooks.get("evaluate")(before); expect(before.effect).toBe("deny")
+      h.cfg.agents.implementer = { ...h.cfg.agents.implementer, name: "renamed-implementer" }
+      write(h.main, ".taskflow/config.jsonc", JSON.stringify(h.cfg))
+    } finally { old.cleanup() }
+    const fresh = await bootPlugin(h, null)
+    fresh.sessions.set(child.id, child)
+    const check = async (action: string, resource: string, agent = child.agent, sessionID = child.id) => {
+      const event = { agent, sessionID, action, resources: [resource], effect: "allow", message: "" }
+      await fresh.hooks.get("evaluate")(event); return event
+    }
+    try {
+      for (const command of commands) expect((await check("shell", command)).effect).toBe("deny")
+      for (const name of [".git", "opencode.json", "opencode.jsonc", ".taskflow/config.jsonc", ".opencode/opencode.jsonc"]) for (const resource of [name, path.join(child.location.directory, name)]) expect((await check("edit", resource)).effect).toBe("deny")
+      const actual = structuredClone(child.metadata)
+      // Presence is ownership evidence even when the identity object itself is invalid or contradictory.
+      for (const invalid of [null, undefined, {}, { ...actual[metadataKey], version: 99 }, { ...actual[metadataKey], role: "lead" }]) {
+        child.metadata = { [metadataKey]: invalid }
+        expect((await check("edit", "src/ordinary.ts")).effect).toBe("deny")
+        expect((await check("shell", commands[0]!)).effect).toBe("deny")
+        expect((await fresh.call("tf_status", {}, { sessionID: child.id, agent: child.agent })).content).toContain("agent identity")
+      }
+      child.metadata = { ...actual, [backend === "openspec" ? "taskflowDispatch" : "taskflowOpenSpecDispatch"]: { version: backend === "openspec" ? 2 : 1, role: "lead", agent: child.agent } }
+      expect((await check("edit", "src/ordinary.ts")).effect).toBe("deny")
+      child.metadata = actual
+      fresh.sessions.set("current", { id: "current", agent: "renamed-implementer", location: { directory: h.main } })
+      expect((await check("edit", "src/ordinary.ts", "renamed-implementer", "current")).effect).toBe("allow")
+      expect((await check("shell", commands[0]!, "renamed-implementer", "current")).effect).toBe("deny")
+      fresh.sessions.set("foreign", { id: "foreign", agent: "custom-user-agent", location: { directory: h.main } })
+      expect((await check("edit", "src/ordinary.ts", "custom-user-agent", "foreign")).effect).toBe("allow")
+      expect((await check("edit", "src/ordinary.ts", "custom-user-agent", "missing-session")).effect).toBe("deny")
+      const get = fresh.host.get
+      fresh.host.get = async () => { throw new Error("unavailable host lookup") }
+      expect((await check("edit", "src/ordinary.ts", "custom-user-agent", "foreign")).effect).toBe("deny")
+      fresh.host.get = get
+      const withoutSession = { agent: "custom-user-agent", action: "edit", resources: ["src/ordinary.ts"], effect: "allow" }
+      await fresh.hooks.get("evaluate")(withoutSession); expect(withoutSession.effect).toBe("deny")
+      expect(fresh.prompts).toHaveLength(0); expect(fresh.creates).toHaveLength(0)
+    } finally { fresh.cleanup() }
+    h.cfg.agents.lead = { ...h.cfg.agents.lead, name: child.agent }
+    write(h.main, ".taskflow/config.jsonc", JSON.stringify(h.cfg))
+    const reassigned = await bootPlugin(h, null)
+    reassigned.sessions.set(child.id, JSON.parse(JSON.stringify(child)))
+    try {
+      const event = { agent: child.agent, sessionID: child.id, action: "edit", resources: ["src/ordinary.ts"], effect: "allow", message: "" }
+      await reassigned.hooks.get("evaluate")(event); expect(event.effect).toBe("deny"); expect(event.message).toContain("agent identity")
+    } finally { reassigned.cleanup() }
+  })
+
   test("nested session locations are refused before normalization, including fresh nested setup and no-config locations", async () => {
     const h = fixture(), r = await startChange(h.main, h.cfg, "demo", true, h.signal), p = await bootPlugin(h)
     const refs = sh("git", ["for-each-ref", "--format=%(refname)"], h.main)
@@ -143,7 +208,7 @@ describe("review regressions at registered plugin boundaries", () => {
       const fresh = await bootPlugin(h, null)
       try {
         // A reloaded host must not reinterpret an existing plugin child as the newly assigned planner role either.
-        fresh.sessions.set("bound-old", { id: "bound-old", agent: "implementer", location: { directory: h.main }, metadata: { [backend === "openspec" ? "taskflowOpenSpecDispatch" : "taskflowDispatch"]: { role: "implementer", agent: "implementer" } } })
+        fresh.sessions.set("bound-old", { id: "bound-old", agent: "implementer", location: { directory: h.main }, metadata: { [backend === "openspec" ? "taskflowOpenSpecDispatch" : "taskflowDispatch"]: { version: backend === "openspec" ? 1 : 2, role: "implementer", agent: "implementer" } } })
         const stale = { agent: "implementer", sessionID: "bound-old", action: "edit", resources: [".taskflow/config.jsonc"], effect: "allow", message: "" }
         await fresh.hooks.get("evaluate")(stale); expect(stale.effect).toBe("deny"); expect(stale.message).toContain("agent identity")
         const e = { agent: "renamed-implementer", sessionID: "parent", action: "shell", resources: [shell[0]!], effect: "allow" }

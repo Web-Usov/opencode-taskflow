@@ -93,6 +93,14 @@ presented at registered tool/session boundaries. Valid current roles retain thei
 For plugin-owned children the persisted declared role/agent binding also constrains the session after reload; an old child
 cannot become a newly assigned planner/lead merely because its name was reused. This only tightens permissions; metadata
 is not authenticated approval, and no role/source binding is automatically rewritten.
+Permission routing reads the actual host session **before** calling a no-longer-registered name foreign. Presence of either
+owned dispatch metadata key is enough to route through the same central caller/bound-identity validator used by tools and
+commands; null, malformed, unsupported-version and conflicting keys never become unbound evidence. Native v1 and standalone
+v2 metadata versions are unchanged. Pure rename + fresh plugin reload therefore cannot drop a retained child's hard gates.
+Only a successful matching session-id/agent/location response with no owned binding establishes an unbound foreign agent,
+whose unrelated actions retain normal behavior. Lookup failures, missing/partial/conflicting evidence and unknown agents
+without a session fail closed. Known standalone session-less legacy events still receive their existing parsed hard guards;
+native session-less events remain refused. Metadata is used only to tighten constraints, not authenticate authority.
 
 Taskflow config diagnostics expose source path and read/parse/validation class, never raw parser text, offending values,
 regular expressions or user-controlled category keys. `loadConfig` sources are sanitized too (optional `errorClass`), so
@@ -155,7 +163,14 @@ are not silently rebound into native changes.
 
 ## Evidence
 
-`bun run check` includes fake executable + real git + fake host/plugin registration/commands/dispatch tests. Optional:
+`bun run check` includes fake executable + real git + fake host/plugin registration/commands/dispatch tests.
+
+The durable permission-reload regression also executes the already-installed published CLI when available. Set
+`OPENSPEC_TEST_EXECUTABLE` to its absolute path; the research scratch executable is a local fallback, and this external-CLI
+test is explicitly skipped when neither exists. It never installs the dependency; standalone and existing fake-CLI coverage
+remain dependency-free. Candidate verification runs this case with actual published 1.16.1, not a fabricated child binding.
+
+Optional adapter smoke:
 
 ```sh
 bun scripts/smoke-openspec.ts /absolute/path/to/already-installed/openspec

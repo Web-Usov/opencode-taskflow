@@ -2,6 +2,9 @@
 
 ## 0.2.0 — unreleased
 
+- Permission routing now reads durable session ownership before treating renamed-away children as foreign after reload;
+  invalid/conflicting owned metadata and unavailable identity fail closed, while confirmed unbound user agents remain
+  unaffected. Registered native/published-CLI and standalone v2 child regressions cover pure rename and JSON round-trip reload.
 - Final review hardening: retain actual host session/setup directory and explicitly refuse nested Git locations before
   action; deny stale/ambiguous/reassigned role identities without asynchronous reload gaps in native and standalone mode;
   sanitize config read/parse/validation diagnostics at source and registered action boundaries, with paths/classes only.
