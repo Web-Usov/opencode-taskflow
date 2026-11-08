@@ -74,11 +74,30 @@ fails closed **before** mutation, native CLI/setup or prompt. Explicit directory
 Same-policy worktree moves remain usable. Otherwise open/reload the plugin in the actual calling worktree; there is no
 silent backend/policy switch inside an old instance. Root and `.opencode` OpenCode config plus inherited ancestor/global
 host config are fingerprinted; changed host inputs require a location reload rather than guessed agent/plugin options.
+**Nested Git subdirectory sessions are unsupported in this MVP, even without a nested config.** The actual host session
+directory is retained before any Git-root normalization; a subdirectory is refused before OpenSpec CLI, prompt, setup or
+mutation. This includes direct `opencode.json`/`opencode.jsonc` and `.opencode/opencode.jsonc` policy below the worktree root:
+they are never silently skipped in favor of parent options. A plugin instance set up at a nested location is diagnostics-
+only/refusing: moving its session to the root does not validate that instance's original nested `ctx.options`. Open a
+fresh root-location instance instead. Git root discovery remains a read-only repository check, not host-policy selection.
 Native dispatch also checks execution-source and reviewer-directory policy before prompting. After reload, execution
 records/child bindings still refuse genuine config/source rebinding. Equal effective policy is not approval of changed
 planning content: source hashes impose their separate stronger constraint. The getter never falls back to setup location
 when session lookup fails. Legacy session-less permission-hook events retain their legacy static/hard checks; native
 events without a session fail closed, and legacy events with a session get the same caller-policy check.
+Registered role identity is remembered as name→role history for the loaded host, not mere name membership. Old names
+after a rename, duplicate role names, reassignment of an old name to another role, disabled roles and not-yet-registered
+new names are denied until a safely configured role session/location is available. No asynchronous reload gap falls back
+to an unrecognized role in the parsed hard guard. This applies to native and standalone permissions, and to role identities
+presented at registered tool/session boundaries. Valid current roles retain their ordinary hard checks.
+For plugin-owned children the persisted declared role/agent binding also constrains the session after reload; an old child
+cannot become a newly assigned planner/lead merely because its name was reused. This only tightens permissions; metadata
+is not authenticated approval, and no role/source binding is automatically rewritten.
+
+Taskflow config diagnostics expose source path and read/parse/validation class, never raw parser text, offending values,
+regular expressions or user-controlled category keys. `loadConfig` sources are sanitized too (optional `errorClass`), so
+doctor/configSources consumers cannot reintroduce those fragments; action gates independently avoid interpolating raw
+`source.error`. Invalid effective configuration still refuses action and names contributing global/project/options layers.
 
 ## Commands and human gates
 

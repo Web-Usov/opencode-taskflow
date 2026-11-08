@@ -42,6 +42,13 @@ precedence; changed ancestor/global/project host inputs require reload, not infe
 directories are checked too. Exact Git entry, root OpenCode config and root AGENTS/CLAUDE instruction documents join
 mandatory native protections regardless of configurable protected overrides.
 
+Actual host directory is preserved separately from repository root. Nested sessions and nested setup instances are
+explicitly unsupported/refused before action, even without nested config; no Git-root normalization can discard host
+policy below that root. Root sessions with equal policy continue normally. Loaded-host name→role history rejects stale,
+colliding or reassigned identities before the inner current-config guard, including while agent reload is pending.
+Config diagnostics are sanitized at the loader (read/parse/validation class, paths, safe field names) and again at caller
+gates; raw JSON fragments/invalid values/regex text/category keys never enter configuration error output.
+
 Mode is explicit backend config or read-only ownership discovery: existing Taskflow config/signatures retain standalone;
 all other projects expect OpenSpec and diagnose missing dependencies without scaffold. Registration never calls OpenSpec
 or scans repository trees. Taskflow commands keep the tf prefix and never replace native opsx commands/skills.

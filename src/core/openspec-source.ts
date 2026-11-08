@@ -77,7 +77,8 @@ export function changeIdentity(root: string, name: string, schema: string, track
     if (!s.isFile() || s.nlink !== 1 || s.size > 64_000 || !(s.mode & 0o444)) throw new Error(`unsafe/unreadable configuration: ${rel}`)
     const text = fs.readFileSync(file, "utf8")
     if (rel.endsWith(".jsonc")) {
-      const value = parseJsonc(text)
+      let value: unknown
+      try { value = parseJsonc(text) } catch { throw new Error(`parse error: invalid Taskflow configuration: ${rel}`) }
       if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`malformed Taskflow configuration: ${rel}`)
     }
     return `${rel}:${digest(text)}`

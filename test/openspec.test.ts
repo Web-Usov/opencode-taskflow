@@ -76,6 +76,118 @@ async function bootPlugin(h: ReturnType<typeof fixture>, options: any = h.cfg, d
 }
 
 describe("review regressions at registered plugin boundaries", () => {
+  test("nested session locations are refused before normalization, including fresh nested setup and no-config locations", async () => {
+    const h = fixture(), r = await startChange(h.main, h.cfg, "demo", true, h.signal), p = await bootPlugin(h)
+    const refs = sh("git", ["for-each-ref", "--format=%(refname)"], h.main)
+    const trees = sh("git", ["worktree", "list", "--porcelain"], h.main)
+    const cliCount = () => fs.existsSync(path.join(h.bin, "calls.jsonl")) ? h.calls().length : 0
+    const check = async (host: Awaited<ReturnType<typeof bootPlugin>>, directory: string) => {
+      host.sessions.set("parent", { id: "parent", location: { directory } })
+      const calls = cliCount(), prompts = host.prompts.length
+      for (const [tool, input] of [["tf_status", {}], ["tf_openspec", { operation: "start", change: "demo", confirm: true }], ["tf_init", {}]] as const) expect((await host.call(tool, input)).content).toMatch(/caller policy.*(root|nested|subdirectory)/)
+      await expect(host.commands.find((c) => c.name === "tf-next").execute({ sessionID: "parent", prompt: { text: "demo" } })).rejects.toThrow("caller policy")
+      for (const action of ["edit", "shell"]) {
+        const event = { agent: "implementer", sessionID: "parent", action, resources: [action === "edit" ? "src/code.ts" : "git status"], effect: "allow", message: "" }
+        await host.hooks.get("evaluate")(event); expect(event.effect).toBe("deny"); expect(event.message).toContain("caller policy")
+      }
+      expect(cliCount()).toBe(calls); expect(host.prompts.length).toBe(prompts); expect(host.creates).toHaveLength(0)
+      expect(sh("git", ["for-each-ref", "--format=%(refname)"], h.main)).toBe(refs)
+      expect(sh("git", ["worktree", "list", "--porcelain"], h.main)).toBe(trees)
+    }
+    try {
+      for (const [index, config] of [null, "opencode.json", "opencode.jsonc", ".opencode/opencode.jsonc"].entries()) {
+        const nested = path.join(r.worktree, `subproject-${index}`); fs.mkdirSync(nested)
+        if (config) write(nested, config, JSON.stringify({ plugins: [{ package: "opencode-taskflow", options: { backend: "standalone", setup: { commands: ["touch MUST-NOT-RUN"] }, agents: { implementer: { name: "nested-agent" } } } }], agents: { implementer: { system: "nested policy" } } }))
+        await check(p, nested)
+        const fresh = await bootPlugin(h, h.cfg, nested)
+        try { await check(fresh, nested); await check(fresh, r.worktree) } finally { fresh.cleanup() }
+        expect(fs.existsSync(path.join(nested, "MUST-NOT-RUN"))).toBe(false)
+        p.sessions.set("parent", { id: "parent", location: { directory: r.worktree } })
+        expect((await p.call("tf_status")).content).toContain('"version": "1.16.1"')
+      }
+      // Even lexical normalization must not erase an intermediate host-policy directory.
+      const noncanonical = `${r.worktree}/subproject-0/..`
+      await check(p, noncanonical)
+      const fresh = await bootPlugin(h, h.cfg, noncanonical)
+      try { await check(fresh, r.worktree) } finally { fresh.cleanup() }
+    } finally { p.cleanup() }
+  })
+
+  for (const backend of ["openspec", "standalone"] as const) test(`${backend}: old role sessions cannot lose parsed hard guards across live rename, collision or reassignment`, async () => {
+    const h = fixture(); h.cfg.backend = backend; h.cfg.protected = ["policy/**"]
+    write(h.main, ".taskflow/config.jsonc", JSON.stringify(h.cfg)); sh("git", ["add", "-A"], h.main); sh("git", ["commit", "-qm", "role policy"], h.main)
+    const p = await bootPlugin(h, null)
+    p.sessions.set("old-session", { id: "old-session", agent: "implementer", location: { directory: h.main } })
+    const shell = ["git -c foo=bar push origin HEAD:main", "env X=1 bash -c 'git -c foo=bar push origin HEAD:main'", "command git -c foo=bar push --force origin HEAD"]
+    const files = [".taskflow/config.jsonc", "policy/human.md", ...(backend === "openspec" ? [".git", "opencode.jsonc"] : [])]
+    const event = async (agent: string, sessionID: string, action: string, resource: string) => {
+      const e = { agent, sessionID, action, resources: [resource], effect: "allow", message: "" }
+      await p.hooks.get("evaluate")(e); return e
+    }
+    try {
+      for (const command of shell) expect((await event("implementer", "old-session", "shell", command)).effect).toBe("deny")
+      for (const [index, delta] of [
+        { implementer: { ...h.cfg.agents.implementer, name: "renamed-implementer" } },
+        { implementer: { ...h.cfg.agents.implementer, name: "reviewer" } },
+        { implementer: { ...h.cfg.agents.implementer, name: "renamed-implementer" }, planner: { ...h.cfg.agents.planner, name: "implementer" } },
+      ].entries()) {
+        write(h.main, ".taskflow/config.jsonc", JSON.stringify({ ...h.cfg, agents: { ...h.cfg.agents, ...delta } }))
+        fs.utimesSync(path.join(h.main, ".taskflow/config.jsonc"), new Date(), new Date(Date.now() + (index + 1) * 2000))
+        for (const command of shell) { const e = await event("implementer", "old-session", "shell", command); expect(e.effect).toBe("deny"); expect(e.message).toContain("agent identity") }
+        for (const file of files) for (const resource of [file, path.join(h.main, file)]) expect((await event("implementer", "old-session", "edit", resource)).effect).toBe("deny")
+        expect((await event("implementer", "old-session", "edit", "src/ordinary.ts")).effect).toBe("deny")
+        if (index === 1) { const e = await event("reviewer", "parent", "edit", "src/ordinary.ts"); expect(e.effect).toBe("deny"); expect(e.message).toContain("agent identity") }
+        // Other still-valid current roles retain their parser-backed protections.
+        expect((await event("qa", "parent", "shell", shell[0]!)).effect).toBe("deny")
+      }
+      const fresh = await bootPlugin(h, null)
+      try {
+        // A reloaded host must not reinterpret an existing plugin child as the newly assigned planner role either.
+        fresh.sessions.set("bound-old", { id: "bound-old", agent: "implementer", location: { directory: h.main }, metadata: { [backend === "openspec" ? "taskflowOpenSpecDispatch" : "taskflowDispatch"]: { role: "implementer", agent: "implementer" } } })
+        const stale = { agent: "implementer", sessionID: "bound-old", action: "edit", resources: [".taskflow/config.jsonc"], effect: "allow", message: "" }
+        await fresh.hooks.get("evaluate")(stale); expect(stale.effect).toBe("deny"); expect(stale.message).toContain("agent identity")
+        const e = { agent: "renamed-implementer", sessionID: "parent", action: "shell", resources: [shell[0]!], effect: "allow" }
+        await fresh.hooks.get("evaluate")(e); expect(e.effect).toBe("deny")
+        const edit = { ...e, action: "edit", resources: ["src/ordinary.ts"], effect: "allow" }
+        await fresh.hooks.get("evaluate")(edit); expect(edit.effect).toBe("allow")
+      } finally { fresh.cleanup() }
+    } finally { p.cleanup() }
+  })
+
+  for (const layer of ["global", "project", "options"] as const) for (const kind of ["parse", "validation"] as const) test(`sanitized ${kind} diagnostics for ${layer} omit synthetic values at every registered boundary`, async () => {
+    const h = fixture(), marker = "SYNTHETIC_SECRET_MUST_NOT_ECHO"
+    const previousXdg = process.env.XDG_CONFIG_HOME
+    process.env.XDG_CONFIG_HOME = path.join(h.dir, "isolated-config")
+    let p: Awaited<ReturnType<typeof bootPlugin>> | undefined
+    try {
+      const base = { backend: "openspec", openspec: h.cfg.openspec, git: h.cfg.git, language: h.cfg.language }
+      write(h.main, ".taskflow/config.jsonc", JSON.stringify(base))
+      const bad = kind === "parse" ? `{"secret": ${marker}}` : JSON.stringify({ parallel: marker })
+      if (layer === "global") write(process.env.XDG_CONFIG_HOME, "opencode/taskflow.jsonc", bad)
+      if (layer === "project") write(h.main, ".taskflow/config.jsonc", kind === "parse" ? bad : JSON.stringify({ ...base, parallel: marker }))
+      const options = layer === "options" ? kind === "parse" ? bad : { parallel: marker } : null
+      p = await bootPlugin(h, options)
+      const visible: string[] = []
+      for (const tool of ["tf_status", "tf_models", "tf_openspec"]) visible.push((await p.call(tool, tool === "tf_openspec" ? { operation: "status" } : {})).content)
+      try { await p.commands.find((c) => c.name === "tf-next").execute({ sessionID: "parent", prompt: { text: "demo" } }) } catch (error) { visible.push(String(error)) }
+      for (const action of ["edit", "shell"]) {
+        const e = { agent: "implementer", sessionID: "parent", action, resources: [action === "edit" ? "src/code.ts" : "git status"], effect: "allow", message: "" }
+        await p.hooks.get("evaluate")(e); expect(e.effect).toBe("deny"); visible.push(e.message)
+      }
+      for (const text of visible) { expect(text).toContain("caller policy"); expect(text).not.toContain(marker); expect(text).toMatch(/parse|read|validation/) }
+      expect(visible[0]).toContain(layer === "options" ? "options" : layer === "global" ? "taskflow.jsonc" : "config.jsonc")
+      const sources = JSON.stringify(loadConfig(h.main, options).sources)
+      expect(sources).not.toContain(marker); expect(sources).toMatch(/parse|read|validation/)
+      if (layer === "project" && kind === "parse") {
+        let diagnostic = ""
+        try { changeIdentity(h.main, "demo", "spec-driven", "openspec/changes/demo/tasks.md") } catch (error) { diagnostic = String(error) }
+        expect(diagnostic).toContain("config.jsonc"); expect(diagnostic).not.toContain(marker)
+      }
+      expect(p.prompts).toHaveLength(0); expect(p.creates).toHaveLength(0)
+      expect(fs.existsSync(path.join(h.bin, "calls.jsonl"))).toBe(false)
+    } finally { p?.cleanup(); if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = previousXdg }
+  })
+
   test("mandatory exact Git/config/instruction entries are protected in a real linked worktree, relative and absolute", async () => {
     const h = fixture(); h.cfg.protected = []
     const r = await startChange(h.main, h.cfg, "demo", true, h.signal), p = await bootPlugin(h)

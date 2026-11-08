@@ -2,6 +2,9 @@
 
 ## 0.2.0 — unreleased
 
+- Final review hardening: retain actual host session/setup directory and explicitly refuse nested Git locations before
+  action; deny stale/ambiguous/reassigned role identities without asynchronous reload gaps in native and standalone mode;
+  sanitize config read/parse/validation diagnostics at source and registered action boundaries, with paths/classes only.
 - Review hardening: mandatory protection for linked-worktree `.git`, root OpenCode config and root AGENTS/CLAUDE;
   post-prompt failure/abort/timeout confirms idle before releasing ownership, retaining unknown leases and active slots
   otherwise. Caller-policy checks cover moved-session tools, direct commands, explicit targets and permission hooks;

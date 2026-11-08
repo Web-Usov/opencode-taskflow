@@ -91,7 +91,9 @@ function dispatchBinding(value: any): DispatchBinding | null {
 export default define({
   id: PLUGIN_ID,
   async setup(ctx: Ctx) {
-    const root = worktreeRoot(ctx.location.directory) ?? ctx.location.directory
+    // Keep the actual host location: collapsing it to the Git root would erase nested OpenCode config/options.
+    const setupDirectory = String(ctx.location.directory)
+    const root = worktreeRoot(setupDirectory) ?? path.resolve(setupDirectory)
     let mainDir = root
     try {
       mainDir = mainCheckout(root)
@@ -101,7 +103,19 @@ export default define({
 
     // ---- config (re-read when the files change) ----
     let loaded: LoadedConfig = loadConfig(root, ctx.options)
-    const registeredRoleNames = new Set(ROLES.map((role) => agentName(loaded.config, role)))
+    const registeredRoles = new Map<string, Set<Role>>()
+    const rememberRole = (name: string, role: Role) => {
+      const identities = registeredRoles.get(name) ?? new Set<Role>()
+      identities.add(role); registeredRoles.set(name, identities)
+    }
+    for (const role of ROLES) rememberRole(agentName(loaded.config, role), role)
+    const agentIdentityProblem = (name: string, cfg: TaskflowConfig): string | null => {
+      const current = ROLES.filter((role) => agentName(cfg, role) === name)
+      const recorded = registeredRoles.get(name)
+      if (!recorded && !current.length) return null // unrelated user agent
+      if (!recorded || recorded.size !== 1 || current.length !== 1 || !recorded.has(current[0]!) || cfg.agents[current[0]!]?.disable) return "taskflow: stale or ambiguous agent identity; open a safely configured new role session and reload this location before continuing"
+      return null
+    }
     let setupHostPolicy: string | undefined
     try { setupHostPolicy = hostPolicy(root) } catch { /* register diagnostics, but refuse actions until host config is fixed/reloaded */ }
     let stamp = configStamp(root)
@@ -167,8 +181,8 @@ export default define({
       for (const role of ROLES) {
         try {
           const a = cfg.agents[role]
-            if (a?.disable) continue
-            registeredRoleNames.add(agentName(cfg, role))
+          if (a?.disable) continue
+          rememberRole(agentName(cfg, role), role)
           const model = resolveChain(agentChain(cfg, role), available).model
           editor.update(agentName(cfg, role), (agent: any) => {
             agent.description = cfg.backend === "openspec" ? `OpenSpec ${role}: ${role === "planner" ? "native planning under human control; no second backlog" : "one selected change, bound execution worktree, verification and independent PR review"}` : ROLE_DESCRIPTIONS[role]
@@ -189,13 +203,19 @@ export default define({
     const assertPolicyAt = (caller: string): string => {
       try {
         const cfg = config()
+        if (setupDirectory !== root) throw new Error("nested plugin setup is unsupported; open/reload the plugin at the exact Git worktree root")
         if (fs.realpathSync(caller) !== caller) throw new Error("select a canonical worktree root")
         const gitRoot = worktreeRoot(caller)
         if (gitRoot && gitRoot !== caller) throw new Error("select the exact git worktree root, not a subdirectory policy")
         if (caller !== root && mainCheckout(caller) !== mainCheckout(root)) throw new Error("caller belongs to a different repository")
         const actual = loadConfig(caller, ctx.options)
         const errors = [...loaded.sources, ...actual.sources].filter((source) => !source.ok)
-        if (errors.length) throw new Error(errors.map((source) => `${source.path}: ${source.error}`).join("; "))
+        if (errors.length) {
+          // Never interpolate arbitrary parser/value diagnostics at an action boundary, even from a future loader.
+          const contributors = [...new Set([...loaded.sources, ...actual.sources].filter((source) => !source.path.startsWith("(")).map((source) => source.path))]
+          if (ctx.options !== undefined && ctx.options !== null) contributors.push("(options)")
+          throw new Error(`${errors.map((source) => `${source.path}: ${source.errorClass ?? "configuration"} error`).join("; ")}. Inspect contributing config sources: ${contributors.join(", ") || "(defaults/options)"}`)
+        }
         if (JSON.stringify(actual.config) !== JSON.stringify(cfg)) throw new Error("effective backend/executable/verify/setup or other Taskflow settings differ")
         if (!setupHostPolicy || hostPolicy(root) !== setupHostPolicy || hostPolicy(caller) !== setupHostPolicy) throw new Error("host OpenCode config differs from this setup location; caller-specific plugin options/agents cannot be inferred")
         return caller
@@ -203,12 +223,27 @@ export default define({
     }
     const assertCallerPolicy = async (sessionID: string): Promise<string> => {
       let directory: unknown
+      let sessionAgent: unknown
+      let boundRole: unknown
+      let boundAgent: unknown
+      let hasRoleBinding = false
       try {
         const response: any = await ctx.session.get({ sessionID: sessionID as any })
-        directory = (response?.data ?? response)?.location?.directory
+        const session = response?.data ?? response
+        directory = session?.location?.directory
+        sessionAgent = session?.agent
+        const binding = session?.metadata?.taskflowOpenSpecDispatch ?? session?.metadata?.taskflowDispatch
+        hasRoleBinding = binding !== undefined
+        boundRole = binding?.role; boundAgent = binding?.agent
       } catch { /* no location means no authorization to use the setup root */ }
       if (typeof directory !== "string" || !path.isAbsolute(directory)) throw new Error("caller policy unavailable: host did not return the calling session location; reload/open the session in its actual worktree before retrying")
-      return assertPolicyAt(worktreeRoot(directory) ?? path.resolve(directory))
+      if (hasRoleBinding && typeof sessionAgent !== "string") throw new Error("taskflow: bound agent identity unavailable; reload/open a safely configured role session before continuing")
+      if (typeof sessionAgent === "string") {
+        if (hasRoleBinding && (typeof boundRole !== "string" || !ROLES.includes(boundRole as Role) || boundAgent !== sessionAgent || agentName(config(), boundRole as Role) !== sessionAgent)) throw new Error("taskflow: stale bound agent identity; start a safely configured new role session rather than reassigning an existing child")
+        const problem = agentIdentityProblem(sessionAgent, config())
+        if (problem) throw new Error(problem)
+      }
+      return assertPolicyAt(directory)
     }
 
     // ---- commands ----
@@ -407,6 +442,7 @@ export default define({
           execute: async (input: any, context: any) => {
             syncRegistrations()
             try {
+              if (context.agent) { const problem = agentIdentityProblem(String(context.agent), config()); if (problem) throw new Error(problem) }
               await assertCallerPolicy(String(context.sessionID))
               if (t.name !== "tf_dispatch" && typeof input?.directory === "string" && input.directory) assertPolicyAt(path.resolve(input.directory))
             } catch (error) { return { content: `ERROR: ${(error as Error).message}` } }
@@ -423,7 +459,10 @@ export default define({
       if (ev.effect === "deny" || (ev.action !== "edit" && ev.action !== "shell")) return
       syncRegistrations()
       const cfg = loaded.config
-      if (!registeredRoleNames.has(String(ev.agent)) && !ROLES.some((r) => agentName(cfg, r) === String(ev.agent))) return
+      if (!registeredRoles.has(String(ev.agent)) && !ROLES.some((r) => agentName(cfg, r) === String(ev.agent))) return
+      if (setupDirectory !== root) { ev.effect = "deny"; ev.message = "caller policy unavailable: nested plugin setup is unsupported; open/reload at the exact Git worktree root"; return }
+      const identityProblem = agentIdentityProblem(String(ev.agent), cfg)
+      if (identityProblem) { ev.effect = "deny"; ev.message = identityProblem; return }
       if (Date.now() - rootsAt > 10_000) {
         roots = worktreePaths(root)
         rootsAt = Date.now()
