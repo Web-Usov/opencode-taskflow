@@ -1,8 +1,50 @@
 # opencode-taskflow
 
-Плагин для **OpenCode V2**, который переносит в любой проект процесс «эпик → задачи → worktree → PR → ревью → слияние»,
-обкатанный в проекте finance. Роли агентов, детерминированные инструменты для системы задач, цепочки моделей (идея из
-oh-my-openagent) и ограничения прав — одной строкой в конфиге.
+Плагин для **OpenCode V2 / OpenChamber**, расширяющий **уже установленный OpenSpec**: одно change → один worktree,
+ветка и PR → независимое ревью → безопасная очистка после merge. OpenSpec остаётся единственным источником proposal,
+requirements, design и checklist. Нативные команды/skills/файлы не меняются при подключении и запуске исполнения.
+
+## Быстрый старт с OpenSpec (основной режим)
+
+Проверенная совместимость: опубликованный `@fission-ai/openspec` **1.16.1**, Node ≥22.12, обычный repo-local
+`openspec/` и **встроенная, не переопределённая `spec-driven` schema**. Custom schemas/tracking, stores/worksets,
+ancestor roots и другие версии пока явно отклоняются. Плагин никогда не устанавливает CLI и не запускает init/update/archive.
+
+1. Подключите плагин как описано в разделе «Установка»; существующему OpenSpec **не нужен `/tf-init`**.
+2. `/tf-doctor` или `/tf-status` — read-only диагностика. `tf_openspec {operation:"inspect",change:"my-change"}`
+   читает native status/apply/validate и проверяет весь конкретный контекст.
+3. Явно попросите выполнить выбранное change (`/tf-next my-change` сначала уточняет намерение).
+   `tf_openspec {operation:"start",change:"my-change",confirm:true}` создаёт worktree от **committed HEAD вызывающего
+   worktree**, а не от main. Dirty/untracked source надо самостоятельно сохранить/закоммитить заранее.
+4. `tf_dispatch {role:"implementer",change:"my-change",prompt:"…"}`, затем reviewer с тем же `change`.
+   Reviewer работает из main, но получает контекст из того же change worktree. Native checklist обновляет implementer
+   только по мере действительно выполненной, разрешённой человеком работы; position/id CLI не являются стабильными ID.
+5. `/tf-ship`: verification/CI, commit/push и один PR. `tf_openspec {operation:"pr",change:"my-change",pr:"https://…/pull/1"}`
+   проверяет и связывает pushed head. Очистка — `operation:"clean",confirm:true` из другого worktree, только после MERGED
+   и без dirty/untracked/extra commits. Архивация остаётся отдельной нативной операцией OpenSpec под контролем человека.
+
+Необязательный конфиг исполнения `.taskflow/config.jsonc`: `{"backend":"openspec","verify":{"full":"bun run check"}}`.
+В OpenSpec-режиме здесь **не создаются** tasks/epics/plans/standards/workflow. Локальные execution records без текста задач
+хранятся в `<git-common-dir>/.taskflow/openspec/`, не загрязняют source worktree и не являются журналом authenticated approval.
+При сбое setup worktree/ветка и любые пользовательские данные сохраняются; автоматического force-rollback нет.
+При ошибке связи с child освобождение lease возможно только после подтверждённого idle; неизвестное состояние сохраняет
+lease и блокирует новое исполнение/cleanup до ручной проверки. Если сессия переехала в worktree с другим/нечитаемым
+конфигом, инструмент остановится до действия и попросит открыть/reload плагин там — старая policy не применяется молча.
+Сессии во вложенных Git-подкаталогах пока явно отклоняются, даже без локального конфига: откройте сессию/плагин в корне
+worktree. Старые/неоднозначные имена ролей после rename блокируются; ошибки конфига не печатают исходные значения.
+
+Выбор режима: явный `backend:"openspec"|"standalone"` важнее discovery. `auto` сохраняет standalone для существующего
+Taskflow config/ownership signature; в остальных проектах ожидает OpenSpec, а не создаёт второй backlog.
+Для проекта с обоими инструментами явно выберите `openspec`; никакой миграции/удаления старых файлов не происходит.
+Без OpenSpec doctor сообщает, что зависимость/проект надо подготовить самостоятельно.
+
+Подробнее: [integration guide](docs/OPENSPEC.md), [architecture](docs/ARCHITECTURE.md).
+
+## Standalone compatibility backend
+
+Далее описан **старый standalone-режим**, не OpenSpec. Для нового standalone-проекта явно задайте
+`backend:"standalone"` в options плагина или конфиге. Существующие проекты и task dispatch metadata v2 сохраняют совместимость.
+Новые OpenSpec-проекты не используют эти task/epic APIs; `tf_start/tf_set/tf_board/tf_clean/tf_standards` в них отключены.
 
 ## Что внутри
 

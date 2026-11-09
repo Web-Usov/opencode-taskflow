@@ -2,6 +2,64 @@
 
 Audience: agents and maintainers. Language: English.
 
+## OpenSpec execution backend (primary product)
+
+OpenSpec is canonical; Taskflow adds execution, not planning. See [OPENSPEC.md](OPENSPEC.md) for the exact API and
+support boundary. `src/core/openspec.ts` reads published CLI 1.16.1 asynchronously with argument arrays and bounded
+timeout/output, preserving HOME/XDG. Named status/apply/validate must agree on exact repo-local root/change/schema.
+Only unshadowed built-in spec-driven is admitted; no blanket custom-schema/version claims. Partial tracking, unreadable
+context or unsafe paths fail closed. All concrete context is independently read, tracked, budgeted and hashed.
+
+`src/core/openspec-source.ts` binds canonical worktree/common git directory, directory identities, selected change,
+config/metadata/global-config digests, non-checklist planning hashes, executable/schema fingerprint and actual tracking
+path. Checklist hashes refresh per call; planning changes require human repair/re-authorization rather than silent scope
+changes. Checklist file content/inode is not a durable task identity. CLI task ids remain positional display data.
+
+`src/core/openspec-execution.ts` serializes claims via persistent per-change exclusive locks in
+`<git-common-dir>/.taskflow/openspec`. Records contain execution association only, not copied planning/checklist text.
+Exclusive atomic install and atomic replacement refuse symlink/hardlink/type escapes. Claims require explicit execution
+intent and clean committed caller HEAD, create one new worktree/branch, then re-probe in it before configured env/setup.
+Failure preserves the worktree and all user work rather than force-removing it; stale locks/failed setup need human repair.
+PR association is checked through gh against the calling repository, exact branch/base/head and complete native checklist.
+Cleanup requires MERGED plus exact recorded head and a clean worktree, then removes only that worktree/local branch;
+native archive/spec promotion, remote deletion and automatic main update are deliberately outside this backend.
+
+`src/openspec-dispatch.ts` uses **taskflowOpenSpecDispatch version 1**, separate from unchanged taskflowDispatch v2.
+Both roles read/revalidate the same change execution worktree; reviewer cwd is main. Parent/role/agent/change/source,
+configuration, concrete reference paths and execution directory are bound and revalidated even after host reload.
+Metadata is local association, never authenticated approval. Native planning files are protected; only the recorded
+tracked checklist in its exact execution worktree is writable by implementer. Shell analysis remains best effort.
+
+`src/core/dispatch-ownership.ts` gates lease release on authoritative idle confirmation. Post-prompt transport/wait errors,
+abort and timeout interrupt then call bounded SDK wait (Promise<void>). Unknown termination or outstanding prompt
+acceptance throws a typed ownership error: the persistent dispatch lease is annotated/retained, the in-host running count
+is not decremented, inventory reports unknown ownership, and cleanup/new children cannot overlap it. Recovery is manual.
+
+Setup-location policy is never silently mixed with moved caller files: registered tools/direct commands/permission hooks
+freshly compare caller effective config/sources and host config fingerprints before action. Same-policy moves are usable;
+different/unavailable/invalid caller policy requires opening/reloading the plugin there. Context options retain highest
+precedence; changed ancestor/global/project host inputs require reload, not inferred options. Native source/reviewer
+directories are checked too. Exact Git entry, root OpenCode config and root AGENTS/CLAUDE instruction documents join
+mandatory native protections regardless of configurable protected overrides.
+
+Actual host directory is preserved separately from repository root. Nested sessions and nested setup instances are
+explicitly unsupported/refused before action, even without nested config; no Git-root normalization can discard host
+policy below that root. Root sessions with equal policy continue normally. Loaded-host name→role history rejects stale,
+colliding or reassigned identities before the inner current-config guard, including while agent reload is pending.
+Config diagnostics are sanitized at the loader (read/parse/validation class, paths, safe field names) and again at caller
+gates; raw JSON fragments/invalid values/regex text/category keys never enter configuration error output.
+
+Permission-hook foreign classification requires actual host session evidence, not only current registration history.
+Either owned metadata key's presence (even invalid/conflicting) routes to the central caller/bound-identity validator shared
+with tools and commands. Lookup failures or unavailable identity cannot prove foreign status; confirmed matching unbound
+foreign sessions remain unaffected. This preserves pure-renamed native v1/standalone v2 children across plugin reload.
+
+Mode is explicit backend config or read-only ownership discovery: existing Taskflow config/signatures retain standalone;
+all other projects expect OpenSpec and diagnose missing dependencies without scaffold. Registration never calls OpenSpec
+or scans repository trees. Taskflow commands keep the tf prefix and never replace native opsx commands/skills.
+
+The remainder describes the **standalone compatibility backend**, unless explicitly noted otherwise.
+
 ## Layout
 
 ```
@@ -19,6 +77,11 @@ src/core/guard.ts      per-role permission rules and the hard guard
 src/core/init.ts       project detection and scaffolding
 src/core/scaffold.ts   full-write-set preflight: portable paths, existing symlink/type confinement, collisions
 src/core/task-source.ts canonical task source association, directory identities, regular-file policy
+src/core/openspec.ts    bounded read-only native CLI adapter
+src/core/openspec-source.ts confined live change sources and local execution records
+src/core/openspec-execution.ts committed-source claim, setup, PR association and lossless merged cleanup
+src/core/dispatch-ownership.ts bounded child stop confirmation and retained unknown ownership
+src/openspec-dispatch.ts separate durable change child association and refreshed source context
 src/core/standards.ts  reference index, deterministic relevance, safe bounded source loading, task binding validation
 templates/             files tf_init copies into a project
 test/                  bun tests (unit + real git repos + parity with finance)

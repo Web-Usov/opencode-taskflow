@@ -300,6 +300,8 @@ describe("running host discovers ownership signature changes", () => {
     }
     if (remove) add()
     const f = fakeCtx(repo.main)
+    // This fixture tests standalone layout cache invalidation, not fresh-project backend discovery.
+    f.ctx.options = { backend: "standalone" }
     const cleanup: any = await (await import("../src/index.ts")).default.setup(f.ctx)
     f.replay()
     try {
@@ -497,17 +499,17 @@ describe("plugin entry with a fake OpenCode context", () => {
     expect(has("reviewer", "taskflow.write", "*")).toBe(true)
   })
 
-  test("13 prefixed commands and 12 tools with permission and codemode:false", () => {
+  test("13 prefixed commands and 13 tools with permission and codemode:false", () => {
     expect(h.commands).toHaveLength(13)
     for (const c of h.commands) expect(c.name.startsWith("tf-")).toBe(true)
-    expect(h.tools).toHaveLength(12)
+    expect(h.tools).toHaveLength(13)
     for (const t of h.tools) {
       expect(["taskflow.read", "taskflow.write", "taskflow.dispatch"]).toContain(t.options.permission)
       expect(t.options.codemode).toBe(false)
     }
   })
 
-  test("guard hook tightens implementer decisions only", () => {
+  test("guard hook tightens Taskflow decisions and preserves confirmed foreign agents", async () => {
     const hook = h.hooks.get("evaluate")!
     const wtDir = path.join(path.dirname(h.main), "app-wt", "t-001-x")
     const run = (ev: any) => {
@@ -519,7 +521,10 @@ describe("plugin entry with a fake OpenCode context", () => {
     expect(edit.message).toContain("protected")
     expect(run({ agent: "implementer", action: "shell", resources: ["bash -c 'gh pr merge 1'"], effect: "allow" }).effect).toBe("deny")
     expect(run({ agent: "implementer", action: "shell", resources: ["git push origin HEAD:main"], effect: "allow" }).effect).toBe("deny")
-    expect(run({ agent: "build", action: "edit", resources: ["epics/E-01.md"], effect: "allow" }).effect).toBe("allow")
+    h.sessions.set("ses_foreign", { id: "ses_foreign", agent: "build", location: { directory: h.main } })
+    const foreign = { agent: "build", sessionID: "ses_foreign", action: "edit", resources: ["epics/E-01.md"], effect: "allow" }
+    await hook(foreign)
+    expect(foreign.effect).toBe("allow")
     const denied = run({ agent: "implementer", action: "edit", resources: ["epics/E-01.md"], effect: "deny" })
     expect(denied.effect).toBe("deny")
     expect(denied.message).toBeUndefined()

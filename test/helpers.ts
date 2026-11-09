@@ -24,7 +24,7 @@ export function write(root: string, rel: string, content: string) {
 
 export function cfg(overrides: unknown = {}): TaskflowConfig {
   // Historical task/epic fixtures deliberately exercise the supported legacy layout.
-  return deepMerge(defaultConfig("en", true), deepMerge({ git: { baseBranch: "main" } }, overrides))
+  return deepMerge(defaultConfig("en", true), deepMerge({ backend: "standalone", git: { baseBranch: "main" } }, overrides))
 }
 
 export function taskFile(o: {

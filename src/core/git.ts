@@ -9,6 +9,8 @@ export interface RunResult {
 }
 
 export interface RunOptions {
+  /** Combined stdout/stderr byte budget; exceeding it fails without returning partial data. */
+  maxOutputBytes?: number
   /** Milliseconds; 0 or undefined = no timeout (setup commands like `pnpm install` may take minutes). */
   timeout?: number
   signal?: AbortSignal
@@ -66,8 +68,21 @@ export function run(cmd: string, args: string[], cwd: string, opts: RunOptions =
     const timer = opts.timeout ? setTimeout(() => kill(`timed out after ${opts.timeout} ms`), opts.timeout) : undefined
     child.stdout.setEncoding("utf8")
     child.stderr.setEncoding("utf8")
-    child.stdout.on("data", (d: string) => (stdout += d))
-    child.stderr.on("data", (d: string) => (stderr += d))
+    let bytes = 0
+    const collect = (d: string, error: boolean) => {
+      if (killed) return
+      bytes += Buffer.byteLength(d)
+      if (opts.maxOutputBytes && bytes > opts.maxOutputBytes) {
+        stdout = ""
+        stderr = ""
+        kill("output budget exceeded")
+        return
+      }
+      if (error) stderr += d
+      else stdout += d
+    }
+    child.stdout.on("data", (d: string) => collect(d, false))
+    child.stderr.on("data", (d: string) => collect(d, true))
     child.on("error", (e) => finish({ ok: false, code: null, stdout, stderr: `${stderr}${e.message}` }))
     child.on("close", (code) => finish({ ok: code === 0 && !killed, code, stdout, stderr }))
     // a command may exit while a background grandchild still holds the pipes (or was killed): resolve on exit after a

@@ -1,5 +1,18 @@
 # Roadmap
 
+## Current direction: OpenSpec execution extension
+
+- First release: existing OpenSpec 1.16.1 with unshadowed built-in spec-driven, repo-local roots; one change/worktree/PR.
+- Keep native planning/artifacts/skills and user commands canonical; no Taskflow backlog or automatic archive.
+- Next: independently test more published releases before widening compatibility; effective custom-schema resolution and
+  arbitrary tracking need a dedicated authority/path contract. No-tracking/manual completion and external stores/worksets
+  are explicitly unsupported in this MVP, not silently mapped to synthetic tasks.
+- Expand isolated native-host and live disposable-PR evidence; no claims based solely on fake-host metadata tests.
+- Failed setup resume/repair UX, stale-lock diagnosis and read-only execution history listing need follow-up work.
+- Existing standalone task metadata/API compatibility remains; no expansion of the custom planner or automatic migration.
+
+The list below records historical standalone ideas, **not commitments for the OpenSpec MVP**.
+
 ## 0.1 (this release)
 
 - Role agents with model chains and permission rules; guard hook.

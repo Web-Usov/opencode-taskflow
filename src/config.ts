@@ -34,6 +34,9 @@ export interface CopySpec {
 }
 
 export interface TaskflowConfig {
+  /** auto discovers existing standalone ownership; otherwise expects OpenSpec. */
+  backend: "auto" | "openspec" | "standalone"
+  openspec: { executable: string }
   language: { human: string; agent: string }
   git: {
     remote: string
@@ -99,6 +102,8 @@ const BOARD_EN = {
 
 export function defaultConfig(humanLanguage = "ru", legacy = false): TaskflowConfig {
   return {
+    backend: "auto",
+    openspec: { executable: "openspec" },
     language: { human: humanLanguage, agent: "en" },
     git: { remote: "origin", baseBranch: null, branchPrefix: "task/", worktreeDir: "../{repo}-wt" },
     paths: legacy
@@ -212,6 +217,7 @@ export interface ConfigSource {
   path: string
   ok: boolean
   error?: string
+  errorClass?: "read" | "parse" | "validation"
 }
 
 export interface LoadedConfig {
@@ -244,12 +250,19 @@ export function hasLegacyLayout(root: string): boolean {
 
 function readLayer(file: string, sources: ConfigSource[]): unknown {
   if (!fs.existsSync(file)) return undefined
+  let text: string
+  try { text = fs.readFileSync(file, "utf8") }
+  catch { sources.push({ path: file, ok: false, errorClass: "read", error: "read error: configuration could not be read" }); return undefined }
   try {
-    const value = parseJsonc(fs.readFileSync(file, "utf8"))
+    const value = parseJsonc(text)
+    if (!isPlainObject(value)) {
+      sources.push({ path: file, ok: false, errorClass: "validation", error: "validation error: configuration must be an object" })
+      return undefined
+    }
     sources.push({ path: file, ok: true })
     return value
-  } catch (e) {
-    sources.push({ path: file, ok: false, error: (e as Error).message })
+  } catch {
+    sources.push({ path: file, ok: false, errorClass: "parse", error: "parse error: invalid JSONC configuration" })
     return undefined
   }
 }
@@ -263,6 +276,7 @@ export function loadConfig(root: string, options: unknown = undefined, globalPat
   const sources: ConfigSource[] = []
   const selected = projectConfigPath(root)
   const layers = [readLayer(globalPath, sources), readLayer(selected, sources), options]
+  if (options !== undefined && options !== null && !isPlainObject(options)) sources.push({ path: "(options)", ok: false, errorClass: "validation", error: "validation error: plugin options must be a configuration object" })
   const explicitLegacy = layers.some((l) => isPlainObject(l) && isPlainObject(l.paths) && l.paths.tasks === "tasks" && (l.paths.epics === "epics" || l.paths.template === "tasks/_template.md"))
   const legacy = selected.endsWith("/.opencode/taskflow.jsonc") || (!fs.existsSync(selected) && (hasLegacyLayout(root) || explicitLegacy))
   if (fs.existsSync(path.join(root, ".taskflow/config.jsonc")) && fs.existsSync(path.join(root, ".opencode/taskflow.jsonc"))) sources.push({ path: path.join(root, ".opencode/taskflow.jsonc"), ok: true, error: "ignored: .taskflow/config.jsonc takes precedence; legacy project layer is not merged" })
@@ -294,9 +308,14 @@ export function loadConfig(root: string, options: unknown = undefined, globalPat
     }
   }
   const problems = validate(config, defaults)
+  if (config.backend === "auto") config.backend = legacy || explicitLegacy ? "standalone" : discoverBackend(root)
+  if (config.backend === "openspec" && /^(opsx|openspec)(?:[-:]|$)/i.test(config.commandPrefix)) {
+    problems.push("commandPrefix: native OpenSpec prefixes are reserved; using tf- without replacing native commands")
+    config.commandPrefix = "tf-"
+  }
   // Discovery, not an inherited global path, determines the project config destination.
   config.paths.config = fs.existsSync(selected) ? path.relative(root, selected).split(path.sep).join("/") : defaults.paths.config
-  if (problems.length) sources.push({ path: "(validation)", ok: false, error: problems.join("; ") })
+  if (problems.length) sources.push({ path: "(validation)", ok: false, errorClass: "validation", error: `validation error: ${problems.join("; ")}` })
   return { config, sources }
 }
 
@@ -318,6 +337,8 @@ const isModelList: Check = (v) => v === undefined || isStrArray(v)
 
 /** Field-level schema: path -> check. A failing field is reset to its default. */
 const SCHEMA: Array<[string, Check]> = [
+  ["backend", oneOf("auto", "openspec", "standalone")],
+  ["openspec.executable", isNonEmpty],
   ["language.human", isStr], ["language.agent", isStr],
   ["git.remote", isNonEmpty], ["git.baseBranch", (v) => v === null || isNonEmpty(v)], ["git.branchPrefix", isNonEmpty], ["git.worktreeDir", isNonEmpty],
   ...["config", "tasks", "epics", "board", "template", "epicTemplate", "workflow", "plans", "standardsGuide", "prTemplate", "humanReviewTemplate", "milestones"].map((k): [string, Check] => [`paths.${k}`, isNonEmpty]),
@@ -345,7 +366,7 @@ export function validate(config: TaskflowConfig, defaults: TaskflowConfig): stri
   const problems: string[] = []
   for (const [p, ok] of SCHEMA) {
     if (!ok(getPath(config, p))) {
-      problems.push(`${p}: invalid value ${JSON.stringify(getPath(config, p))}, using the default`)
+      problems.push(`${p}: invalid field value; using the default`)
       setPath(config, p, getPath(defaults, p))
     }
   }
@@ -365,8 +386,8 @@ export function validate(config: TaskflowConfig, defaults: TaskflowConfig): stri
         new RegExp(config.spec.definition)
         new RegExp(config.spec.questionPattern)
         new RegExp(config.spec.acceptancePattern)
-      } catch (e) {
-        problems.push(`spec: invalid regular expression (${(e as Error).message}); spec checks disabled`)
+      } catch {
+        problems.push("spec: invalid regular expression; spec checks disabled")
         config.spec = null
       }
     }
@@ -392,7 +413,7 @@ export function validate(config: TaskflowConfig, defaults: TaskflowConfig): stri
   }
   for (const [name, c] of Object.entries(config.categories)) {
     if (!isPlainObject(c) || !isStrArray(c.models)) {
-      problems.push(`categories.${name}: needs a models list; dropped`)
+      problems.push("categories: invalid entry models list; entry dropped")
       delete config.categories[name]
     }
   }
@@ -418,7 +439,15 @@ export function configStamp(root: string, globalPath = globalConfigPath()): stri
   const templates = [".github/pull_request_template.md", ".github/PULL_REQUEST_TEMPLATE/human-review.md"].map((rel) => {
     try { return fs.statSync(path.join(root, rel)).isFile() } catch { return false }
   })
-  return files + "|" + (candidates.some((f) => fs.existsSync(f)) ? "configured" : JSON.stringify(legacyLayoutSignature(root))) + "|" + JSON.stringify(templates)
+  return files + "|" + discoverBackend(root) + "|" + (candidates.some((f) => fs.existsSync(f)) ? "configured" : JSON.stringify(legacyLayoutSignature(root))) + "|" + JSON.stringify(templates)
+}
+
+/** No ancestor search and no CLI calls at host registration. Existing Taskflow config retains compatibility. */
+export function discoverBackend(root: string): "openspec" | "standalone" {
+  let central = false
+  try { const f = path.join(root, ".taskflow/workflow.md"); central = fs.statSync(f).size < 64_000 && /opencode-taskflow/.test(fs.readFileSync(f, "utf8")) } catch { /* no ownership signature */ }
+  if ([".taskflow/config.jsonc", ".opencode/taskflow.jsonc"].some((p) => fs.existsSync(path.join(root, p))) || central || hasLegacyLayout(root)) return "standalone"
+  return "openspec"
 }
 
 export function agentName(config: TaskflowConfig, role: Role): string {

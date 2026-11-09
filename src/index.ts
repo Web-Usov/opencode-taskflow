@@ -1,5 +1,5 @@
 /**
- * opencode-taskflow: an OpenCode V2 plugin that runs the epic -> task -> worktree -> PR -> review -> merge workflow.
+ * opencode-taskflow: OpenSpec change execution for OpenCode V2, with a standalone Taskflow compatibility backend.
  *
  * - Registers role agents (lead, planner, implementer, reviewer, qa) with prompts, model chains and permission rules.
  *   A project agent file with the same name overrides any field it defines.
@@ -10,8 +10,10 @@
  * Only types are imported from `@opencode/plugin`, so the plugin has no runtime dependencies.
  */
 import path from "node:path"
+import fs from "node:fs"
+import os from "node:os"
 import type { Plugin } from "@opencode/plugin"
-import { agentChain, agentName, configStamp, loadConfig, ROLES, type LoadedConfig, type Role, type TaskflowConfig } from "./config.ts"
+import { agentChain, agentName, configStamp, loadConfig, parseJsonc, ROLES, type LoadedConfig, type Role, type TaskflowConfig } from "./config.ts"
 import { commandSpecs } from "./commands.ts"
 import { claim, worktreeParent } from "./core/claim.ts"
 import { detectBaseBranch, mainCheckout, worktreePaths, worktreeRoot } from "./core/git.ts"
@@ -22,6 +24,43 @@ import { taskStandards, type StandardsContext } from "./core/standards.ts"
 import { isTaskSourceIdentity, readTaskSource, type TaskSourceIdentity } from "./core/task-source.ts"
 import { ROLE_DESCRIPTIONS, roleMode, rolePrompt } from "./roles.ts"
 import { buildTools, childResult, dispatchChain, taskWorktree, type DispatchInput, type DispatchResult } from "./tools.ts"
+import { dispatchChange } from "./openspec-dispatch.ts"
+import { dispatchLeaseCount, executionLock } from "./core/openspec-execution.ts"
+import { UnknownChildState } from "./core/dispatch-ownership.ts"
+import { digest } from "./core/openspec-source.ts"
+
+/** Host options belong to setup location. Never infer different-location options from the original ctx.options. */
+function hostPolicy(root: string): string {
+  const names = ["opencode.json", "opencode.jsonc", ".opencode/opencode.json", ".opencode/opencode.jsonc"]
+  const candidates = names.map((relative) => ({ base: root, relative, key: `project:${relative}` }))
+  const global = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "opencode")
+  for (const relative of ["opencode.json", "opencode.jsonc"]) candidates.push({ base: global, relative, key: `global:${path.join(global, relative)}` })
+  // OpenCode host discovery also inherits ancestor configuration above the git boundary. Absolute ancestor identity
+  // matters: identical bytes at a different path can resolve relative plugin/options differently.
+  let ancestor = path.dirname(root)
+  for (;;) {
+    for (const relative of names) if (fs.existsSync(path.join(ancestor, relative))) candidates.push({ base: ancestor, relative, key: `ancestor:${path.join(ancestor, relative)}` })
+    const parent = path.dirname(ancestor)
+    if (parent === ancestor) break
+    ancestor = parent
+  }
+  return digest(candidates.map(({ base, relative, key }) => {
+    let current = base
+    for (const part of relative.split("/")) {
+      current = path.join(current, part)
+      let stat: fs.Stats
+      try { stat = fs.lstatSync(current) } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return `${key}:absent`; throw error }
+      if (stat.isSymbolicLink()) throw new Error(`symlink host config unsupported: ${relative}`)
+    }
+    const stat = fs.statSync(current)
+    if (!stat.isFile() || stat.nlink !== 1 || stat.size > 256_000 || !(stat.mode & 0o444)) throw new Error(`unsafe/unreadable host config: ${relative}`)
+    const text = fs.readFileSync(current, "utf8")
+    let value: unknown
+    try { value = parseJsonc(text) } catch { throw new Error(`malformed OpenCode host config: ${key}`) }
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`invalid host config: ${relative}`)
+    return `${key}:${digest(text)}`
+  }).join("\n"))
+}
 
 type Ctx = Plugin.Context
 
@@ -52,7 +91,9 @@ function dispatchBinding(value: any): DispatchBinding | null {
 export default define({
   id: PLUGIN_ID,
   async setup(ctx: Ctx) {
-    const root = worktreeRoot(ctx.location.directory) ?? ctx.location.directory
+    // Keep the actual host location: collapsing it to the Git root would erase nested OpenCode config/options.
+    const setupDirectory = String(ctx.location.directory)
+    const root = worktreeRoot(setupDirectory) ?? path.resolve(setupDirectory)
     let mainDir = root
     try {
       mainDir = mainCheckout(root)
@@ -62,6 +103,21 @@ export default define({
 
     // ---- config (re-read when the files change) ----
     let loaded: LoadedConfig = loadConfig(root, ctx.options)
+    const registeredRoles = new Map<string, Set<Role>>()
+    const rememberRole = (name: string, role: Role) => {
+      const identities = registeredRoles.get(name) ?? new Set<Role>()
+      identities.add(role); registeredRoles.set(name, identities)
+    }
+    for (const role of ROLES) rememberRole(agentName(loaded.config, role), role)
+    const agentIdentityProblem = (name: string, cfg: TaskflowConfig): string | null => {
+      const current = ROLES.filter((role) => agentName(cfg, role) === name)
+      const recorded = registeredRoles.get(name)
+      if (!recorded && !current.length) return null // unrelated user agent
+      if (!recorded || recorded.size !== 1 || current.length !== 1 || !recorded.has(current[0]!) || cfg.agents[current[0]!]?.disable) return "taskflow: stale or ambiguous agent identity; open a safely configured new role session and reload this location before continuing"
+      return null
+    }
+    let setupHostPolicy: string | undefined
+    try { setupHostPolicy = hostPolicy(root) } catch { /* register diagnostics, but refuse actions until host config is fixed/reloaded */ }
     let stamp = configStamp(root)
     let registrationsStale = false
     const config = (): TaskflowConfig => {
@@ -126,9 +182,10 @@ export default define({
         try {
           const a = cfg.agents[role]
           if (a?.disable) continue
+          rememberRole(agentName(cfg, role), role)
           const model = resolveChain(agentChain(cfg, role), available).model
           editor.update(agentName(cfg, role), (agent: any) => {
-            agent.description = ROLE_DESCRIPTIONS[role]
+            agent.description = cfg.backend === "openspec" ? `OpenSpec ${role}: ${role === "planner" ? "native planning under human control; no second backlog" : "one selected change, bound execution worktree, verification and independent PR review"}` : ROLE_DESCRIPTIONS[role]
             agent.mode = roleMode(role)
             agent.system = rolePrompt(cfg, role, lay)
             if (model) agent.model = modelRef(model)
@@ -140,16 +197,57 @@ export default define({
       }
     })
 
-    // ---- session -> worktree (not cached: sessions move, worktrees get removed) ----
-    const sessionRoot = async (sessionID: string): Promise<string> => {
+    // ---- session -> worktree (not cached and NEVER falls back to stale setup policy/location) ----
+    const sessionRoot = async (sessionID: string): Promise<string> => assertCallerPolicy(sessionID)
+
+    const assertPolicyAt = (caller: string): string => {
       try {
-        const sess: any = await ctx.session.get({ sessionID: sessionID as any } as any)
-        const dir = sess?.location?.directory ?? sess?.data?.location?.directory
-        if (typeof dir === "string") return worktreeRoot(dir) ?? dir
-      } catch {
-        /* fall back to the plugin instance */
+        const cfg = config()
+        if (setupDirectory !== root) throw new Error("nested plugin setup is unsupported; open/reload the plugin at the exact Git worktree root")
+        if (fs.realpathSync(caller) !== caller) throw new Error("select a canonical worktree root")
+        const gitRoot = worktreeRoot(caller)
+        if (gitRoot && gitRoot !== caller) throw new Error("select the exact git worktree root, not a subdirectory policy")
+        if (caller !== root && mainCheckout(caller) !== mainCheckout(root)) throw new Error("caller belongs to a different repository")
+        const actual = loadConfig(caller, ctx.options)
+        const errors = [...loaded.sources, ...actual.sources].filter((source) => !source.ok)
+        if (errors.length) {
+          // Never interpolate arbitrary parser/value diagnostics at an action boundary, even from a future loader.
+          const contributors = [...new Set([...loaded.sources, ...actual.sources].filter((source) => !source.path.startsWith("(")).map((source) => source.path))]
+          if (ctx.options !== undefined && ctx.options !== null) contributors.push("(options)")
+          throw new Error(`${errors.map((source) => `${source.path}: ${source.errorClass ?? "configuration"} error`).join("; ")}. Inspect contributing config sources: ${contributors.join(", ") || "(defaults/options)"}`)
+        }
+        if (JSON.stringify(actual.config) !== JSON.stringify(cfg)) throw new Error("effective backend/executable/verify/setup or other Taskflow settings differ")
+        if (!setupHostPolicy || hostPolicy(root) !== setupHostPolicy || hostPolicy(caller) !== setupHostPolicy) throw new Error("host OpenCode config differs from this setup location; caller-specific plugin options/agents cannot be inferred")
+        return caller
+      } catch (error) { throw new Error(`caller policy unavailable/differs: ${(error as Error).message}. Open/reload the plugin in the calling worktree (${caller}) before using Taskflow; no operation was started.`) }
+    }
+    // Ownership presence is not successful parsing: null/invalid/conflicting plugin keys must never route as foreign.
+    const hasChildBinding = (session: any): boolean => ["taskflowOpenSpecDispatch", "taskflowDispatch"].some((key) => Object.prototype.hasOwnProperty.call(session?.metadata ?? {}, key))
+    const readCallerSession = async (sessionID: string): Promise<any> => {
+      let session: any
+      try {
+        const response: any = await ctx.session.get({ sessionID: sessionID as any })
+        session = response?.data ?? response
+      } catch { /* failed lookup cannot prove a session is unbound/foreign */ }
+      if (!session || typeof session !== "object" || Array.isArray(session) || session.id !== sessionID || (session.metadata !== undefined && (!session.metadata || typeof session.metadata !== "object" || Array.isArray(session.metadata)))) throw new Error("caller policy unavailable: missing, invalid or conflicting host session evidence; reload/open the actual session before retrying")
+      return session
+    }
+    const assertCallerPolicy = async (sessionID: string, evidence?: any): Promise<string> => {
+      const session = evidence ?? await readCallerSession(sessionID)
+      const directory = session.location?.directory, sessionAgent = session.agent
+      const hasRoleBinding = hasChildBinding(session)
+      const native = Object.prototype.hasOwnProperty.call(session.metadata ?? {}, "taskflowOpenSpecDispatch")
+      const legacy = Object.prototype.hasOwnProperty.call(session.metadata ?? {}, "taskflowDispatch")
+      const binding = native ? session.metadata.taskflowOpenSpecDispatch : session.metadata?.taskflowDispatch
+      if (hasRoleBinding && (native === legacy || !binding || typeof binding !== "object" || Array.isArray(binding) || binding.version !== (native ? 1 : 2) || !ROLES.includes(binding.role) || binding.role === "lead" || typeof binding.agent !== "string" || !binding.agent)) throw new Error("taskflow: invalid or conflicting bound agent identity; start a safely configured new role session")
+      if (typeof directory !== "string" || !path.isAbsolute(directory)) throw new Error("caller policy unavailable: host did not return the calling session location; reload/open the session in its actual worktree before retrying")
+      if (hasRoleBinding && typeof sessionAgent !== "string") throw new Error("taskflow: bound agent identity unavailable; reload/open a safely configured role session before continuing")
+      if (typeof sessionAgent === "string") {
+        if (hasRoleBinding && (binding.agent !== sessionAgent || agentName(config(), binding.role as Role) !== sessionAgent)) throw new Error("taskflow: stale bound agent identity; start a safely configured new role session rather than reassigning an existing child")
+        const problem = agentIdentityProblem(sessionAgent, config())
+        if (problem) throw new Error(problem)
       }
-      return root
+      return assertPolicyAt(directory)
     }
 
     // ---- commands ----
@@ -162,10 +260,14 @@ export default define({
         return
       }
       for (const spec of commandSpecs(cfg, lay)) {
+        const commandName = spec.name
         editor.add({
           name: spec.name,
           description: spec.description,
           execute: async ({ sessionID, prompt, delivery }) => {
+            await assertCallerPolicy(String(sessionID))
+            const spec = commandSpecs(config(), layout()).find((candidate) => candidate.name === commandName)
+            if (!spec) throw new Error("caller policy command registration changed; reload commands in the calling worktree")
             const args = prompt.text ?? ""
             let report: string | undefined
             let switchTo: Role | undefined = spec.switchTo
@@ -210,10 +312,38 @@ export default define({
     // Host session metadata is durable across plugin reloads; cache only supports hosts that omit metadata on get.
     // No source snapshot or approval database: every continuation still loads the current task binding.
     const children = new Map<string, DispatchBinding>()
+    const changeChildren = new Map<string, string>()
     const dispatch = async (input: DispatchInput): Promise<DispatchResult> => {
       if (input.signal.aborted) throw new Error("aborted")
+      await assertCallerPolicy(input.parentSessionID)
       const cfg = config()
       const agent = agentName(cfg, input.role)
+      let changeContinuation = false
+      let continuedChange: unknown
+      if (input.sessionID) {
+        const response: any = await ctx.session.get({ sessionID: input.sessionID as any })
+        changeContinuation = (response?.data ?? response)?.metadata?.taskflowOpenSpecDispatch !== undefined
+        continuedChange = (response?.data ?? response)?.metadata?.taskflowOpenSpecDispatch?.change
+      }
+      if (input.change !== undefined || changeContinuation) {
+        if (cfg.backend !== "openspec") throw new Error("OpenSpec dispatch requires backend=openspec")
+        if (loaded.sources.some((source) => !source.ok)) throw new Error("invalid/unreadable Taskflow configuration; repair the reported config diagnostics before dispatch")
+        const change = input.change ?? continuedChange
+        if (typeof change !== "string") throw new Error("invalid OpenSpec change continuation")
+        const sourceRoot = await sessionRoot(input.parentSessionID)
+        if (input.role === "implementer" && Math.max(running.get("implementer") ?? 0, dispatchLeaseCount(sourceRoot)) >= cfg.parallel) throw new Error(`${cfg.parallel} implementer(s) already running or conservatively owned by held/unknown leases; confirm stopped children before manual recovery`)
+        running.set(input.role, (running.get(input.role) ?? 0) + 1)
+        let unresolved = false
+        try {
+          return await executionLock(sourceRoot, change, async () => {
+            if (!available.length) await refreshModels()
+            const model = resolveChain(agentChain(cfg, input.role), available).model
+            return dispatchChange(ctx.session, sourceRoot, mainDir, cfg, input, model ? modelRef(model) : null, changeChildren, assertPolicyAt)
+          }, "dispatch")
+        } catch (error) { unresolved = error instanceof UnknownChildState; throw error }
+        finally { if (!unresolved) running.set(input.role, Math.max(0, (running.get(input.role) ?? 1) - 1)) }
+      }
+      if (cfg.backend === "openspec") throw new Error("OpenSpec mode requires an explicit change for new dispatch; legacy task dispatch is disabled")
       let taskID = input.task
       let boundDirectory: string | undefined
       let boundSource: TaskSourceIdentity | null = null
@@ -306,7 +436,7 @@ export default define({
 
     // ---- tools ----
     await ctx.tool.transform((editor) => {
-      editor.namespace({ name: "taskflow", description: "Task system and orchestration tools (opencode-taskflow)" })
+      editor.namespace({ name: "taskflow", description: config().backend === "openspec" ? "OpenSpec change execution and role orchestration (opencode-taskflow)" : "Task system and orchestration tools (opencode-taskflow)" })
       for (const t of buildTools({ root: () => root, sessionRoot, layout, config, configSources: () => loaded.sources, models: () => available, refreshModels, reloadRegistrations, dispatch })) {
         editor.add({
           name: t.name,
@@ -315,6 +445,11 @@ export default define({
           options: { namespace: "taskflow", codemode: false, permission: t.permission },
           execute: async (input: any, context: any) => {
             syncRegistrations()
+            try {
+              if (context.agent) { const problem = agentIdentityProblem(String(context.agent), config()); if (problem) throw new Error(problem) }
+              await assertCallerPolicy(String(context.sessionID))
+              if (t.name !== "tf_dispatch" && typeof input?.directory === "string" && input.directory) assertPolicyAt(path.resolve(input.directory))
+            } catch (error) { return { content: `ERROR: ${(error as Error).message}` } }
             return { content: await t.execute(input ?? {}, { sessionID: String(context.sessionID), agent: context.agent ? String(context.agent) : undefined, signal: context.signal }) }
           },
         })
@@ -328,7 +463,12 @@ export default define({
       if (ev.effect === "deny" || (ev.action !== "edit" && ev.action !== "shell")) return
       syncRegistrations()
       const cfg = loaded.config
-      if (!ROLES.some((r) => agentName(cfg, r) === String(ev.agent))) return
+      const knownRole = registeredRoles.has(String(ev.agent)) || ROLES.some((r) => agentName(cfg, r) === String(ev.agent))
+      if (knownRole) {
+        if (setupDirectory !== root) { ev.effect = "deny"; ev.message = "caller policy unavailable: nested plugin setup is unsupported; open/reload at the exact Git worktree root"; return }
+        const identityProblem = agentIdentityProblem(String(ev.agent), cfg)
+        if (identityProblem) { ev.effect = "deny"; ev.message = identityProblem; return }
+      }
       if (Date.now() - rootsAt > 10_000) {
         roots = worktreePaths(root)
         rootsAt = Date.now()
@@ -337,13 +477,25 @@ export default define({
       try {
         lay = layout()
       } catch {
+        ev.effect = "deny"
+        ev.message = "caller policy unavailable: repository layout could not be established"
         return
       }
-      const reason = guard(cfg, { agent: ev.agent ? String(ev.agent) : undefined, action: ev.action, resources: ev.resources }, { base: lay.base, roots: roots.length ? roots : [root], worktreeParent: lay.worktreeParent })
-      if (reason) {
-        ev.effect = "deny"
-        ev.message = reason
+      const evaluate = (executionRoot?: string) => {
+        const reason = guard(cfg, { agent: ev.agent ? String(ev.agent) : undefined, action: ev.action, resources: ev.resources }, { base: lay.base, roots: roots.length ? roots : [root], worktreeParent: lay.worktreeParent, executionRoot })
+        if (reason) { ev.effect = "deny"; ev.message = reason }
       }
+      if (ev.sessionID) return readCallerSession(String(ev.sessionID)).then(async (session) => {
+        if (!knownRole && !hasChildBinding(session)) {
+          if (typeof session.agent === "string" && session.agent && session.agent === String(ev.agent) && typeof session.location?.directory === "string" && path.isAbsolute(session.location.directory)) return // positively unbound foreign user agent
+          throw new Error("caller policy unavailable: cannot establish an unbound foreign agent identity from host session evidence")
+        }
+        if (typeof session.agent === "string" && session.agent !== String(ev.agent)) throw new Error("taskflow: conflicting event/session agent identity; reload the actual role session")
+        evaluate(await assertCallerPolicy(String(ev.sessionID), session))
+      }).catch((error) => { ev.effect = "deny"; ev.message = (error as Error).message })
+      if (!knownRole) { ev.effect = "deny"; ev.message = "caller policy unavailable: no session evidence to establish that this agent is unbound/foreign"; return }
+      if (cfg.backend === "openspec") { ev.effect = "deny"; ev.message = "caller policy unavailable: permission event has no session location; reload in the calling worktree"; return }
+      evaluate()
     })
 
     // The model registry may fill after this plugin's setup (provider plugins load in parallel, logins happen later).

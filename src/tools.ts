@@ -9,6 +9,10 @@ import { init } from "./core/init.ts"
 import { formatModelRef, resolveChain, routeCategory, type AvailableModel, type ModelRef } from "./core/models.ts"
 import { check, info, loadTasks, loadTasksFromRef, notReadyReason, readyTasks, setStatus, summary, writeBoard, type Doc } from "./core/tasks.ts"
 import { loadStandards, readStandardsIndex, standardIds, suggestStandards } from "./core/standards.ts"
+import { discoverBackend } from "./config.ts"
+import { OpenSpec } from "./core/openspec.ts"
+import { cleanChange, recordChangePR, startChange } from "./core/openspec-execution.ts"
+import { validateExecution } from "./core/openspec-source.ts"
 
 /** What the tools need from the plugin host; injected so the tools are testable without OpenCode. */
 export interface ToolHost {
@@ -29,6 +33,7 @@ export interface DispatchInput {
   role: Role
   prompt: string
   task?: string
+  change?: string
   directory?: string
   sessionID?: string
   parentSessionID: string
@@ -45,6 +50,7 @@ export interface DispatchResult {
   outcome: string | null
   error: string | null
   standards?: Array<{ id: string; path: string; sha256: string }>
+  references?: Array<{ path: string; sha256: string }>
 }
 
 export interface ToolCallContext {
@@ -141,7 +147,31 @@ export function buildTools(host: ToolHost): ToolDef[] {
     return docs ? { docs, source: ref! + note } : { docs: loadTasks(root, cfg), source: "working tree" + note }
   }
 
-  return [
+  const tools: ToolDef[] = [
+    {
+      name: "tf_openspec",
+      permission: TOOL_PERMISSION.write,
+      description: "OpenSpec execution extension (published CLI 1.16.1, unshadowed built-in spec-driven, repo-local roots). status/inspect are read-only; start requires explicit user execution intent confirm=true. One change/worktree/branch/PR; pr associates verified pushed head; clean requires associated MERGED PR and no lost work. Never initializes, edits native artifacts, installs, archives or promotes specs.",
+      input: obj({ operation: { type: "string", enum: ["status", "inspect", "start", "pr", "clean"] }, change: str("Native active change name, not a checkbox/task id"), confirm: bool("Explicit user execution or cleanup intent; not authenticated approval"), pr: str("Associated HTTPS pull request URL") }, ["operation"]),
+      async execute(input, ctx) {
+        try {
+          const root = await host.sessionRoot(ctx.sessionID)
+          const cfg = cfgNow()
+          if ((cfg.backend === "auto" ? discoverBackend(root) : cfg.backend) !== "openspec") throw new Error("standalone backend selected; explicitly select backend openspec to opt in without migration")
+          if (host.configSources().some((s) => !s.ok)) throw new Error("invalid/unreadable Taskflow configuration; inspect config diagnostics and repair it explicitly before native lifecycle operations")
+          if (["start", "clean"].includes(input.operation) && !mayDispatch(cfg, ctx.agent)) throw new Error("only lead or the human's own session may start or clean executions")
+          if (input.operation === "pr" && !mayDispatch(cfg, ctx.agent) && (ctx.agent !== agentName(cfg, "implementer") || validateExecution(root, input.change).worktree !== root)) throw new Error("PR association is permitted only from its actual implementer worktree, lead or the human's own session")
+          const adapter = new OpenSpec(cfg)
+          const result = input.operation === "status" ? await adapter.inventory(root, ctx.signal)
+            : input.operation === "inspect" ? await adapter.inspect(root, input.change, ctx.signal)
+            : input.operation === "start" ? await startChange(root, cfg, input.change, input.confirm, ctx.signal)
+            : input.operation === "pr" ? await recordChangePR(root, cfg, input.change, input.pr, ctx.signal)
+            : input.operation === "clean" ? await cleanChange(root, cfg, input.change, input.confirm, ctx.signal)
+            : (() => { throw new Error("unknown operation") })()
+          return JSON.stringify(result, null, 2)
+        } catch (e) { return `ERROR: ${(e as Error).message}` }
+      },
+    },
     {
       name: "tf_standards",
       permission: TOOL_PERMISSION.read,
@@ -394,6 +424,7 @@ export function buildTools(host: ToolHost): ToolDef[] {
           role: str("planner | implementer | reviewer | qa"),
           prompt: str("Complete instructions; the child starts with a fresh context"),
           task: str("Task id this work belongs to"),
+          change: str("OpenSpec change execution association (mutually exclusive with task). Reviewer reads the same change worktree while running from main. Omit only on bound continuation."),
           directory: str("Working directory for the child (default: the task's worktree, else the main checkout)"),
           sessionID: str("Continue this child with its original role/task and durable task-source identity (v2 session metadata), separately from execution directory. Omitted task reuses it; changed source repository/worktree, task directory/file, role/parent/directory are rejected before prompting. Unrecoverable old metadata requires a new child; contents are refreshed, not snapshotted."),
         },
@@ -404,11 +435,12 @@ export function buildTools(host: ToolHost): ToolDef[] {
         if (!ROLES.includes(role) || role === "lead") return "ERROR: role must be one of planner, implementer, reviewer, qa"
         if (!mayDispatch(cfgNow(), ctx.agent)) return `ERROR: ${ctx.agent} may not dispatch other agents; only the lead (or the human's own session) does`
         try {
-          const r = await host.dispatch({ role, prompt: input.prompt, task: input.task, directory: input.directory, sessionID: input.sessionID, parentSessionID: ctx.sessionID, callerAgent: ctx.agent, signal: ctx.signal })
+          const r = await host.dispatch({ role, prompt: input.prompt, task: input.task, change: input.change, directory: input.directory, sessionID: input.sessionID, parentSessionID: ctx.sessionID, callerAgent: ctx.agent, signal: ctx.signal })
           return [
             `child session: ${r.sessionID}`,
             `agent: ${r.agent} · model: ${r.model ?? "inherited"} · directory: ${r.directory} · outcome: ${r.outcome ?? "unknown"}`,
             `standards: ${r.standards?.map((s) => `${s.id} -> ${s.path} (sha256 ${s.sha256})`).join("; ") || "none explicitly selected"}`,
+            ...(r.references ? [`OpenSpec references: ${r.references.map((r) => `${r.path} (sha256 ${r.sha256})`).join("; ")}`] : []),
             r.error ? `ERROR in child: ${r.error}` : "",
             "",
             r.text || "(no final text)",
@@ -441,6 +473,26 @@ export function buildTools(host: ToolHost): ToolDef[] {
       },
     },
   ]
+  const native = cfgNow().backend === "openspec"
+  const diagnosticNames = ["tf_status", "tf_next", "tf_check", "tf_models", "tf_init"]
+  const nativeDescription = (name: string) => name === "tf_dispatch" ? "Run an implementer/reviewer/qa child for one claimed OpenSpec change, or continue its bound sessionID. Both roles read the SAME execution worktree's live context; reviewer cwd is main. Parent/role/agent/change/source/config/schema/directory cannot silently rebind. Returns current reference hashes and child outcome; planning stays native OpenSpec."
+    : diagnosticNames.includes(name) ? "Read-only OpenSpec doctor/status: tested CLI version, repo-local root, active changes, execution associations and config diagnostics. No init, planning scaffold, paid models, installs or native mutations. Inspect a selected change with tf_openspec for validation/readiness/context."
+    : `Standalone-only API, disabled in OpenSpec mode. Use tf_openspec with a native change instead of ${name}; no second task/epic/board/standards backlog.`
+  return tools.map((tool) => ({ ...tool,
+    ...(native && tool.name !== "tf_openspec" ? { description: nativeDescription(tool.name) } : {}),
+    ...(native && diagnosticNames.includes(tool.name) ? { input: obj({}) } : {}),
+    ...(native && tool.name === "tf_dispatch" ? { input: obj({ role: { type: "string", enum: ["implementer", "reviewer", "qa"] }, prompt: str("Complete user-authorized execution/review instructions"), change: str("Native claimed change; required for a new child, optional on bound continuation"), sessionID: str("Continue the same parent/role/agent/change/source/directory association after revalidation"), directory: str("Optional exact associated execution directory; substitutions refused") }, ["role", "prompt"]) } : {}),
+    execute: async (input, ctx) => {
+    const root = await host.sessionRoot(ctx.sessionID)
+    const cfg = cfgNow()
+    const backend = cfg.backend === "auto" ? discoverBackend(root) : cfg.backend
+    if (backend !== "openspec" || tool.name === "tf_openspec" || tool.name === "tf_dispatch") return tool.execute(input, ctx)
+    if (diagnosticNames.includes(tool.name)) {
+      try { return JSON.stringify({ ...await new OpenSpec(cfg).inventory(root, ctx.signal), backend: "openspec", config: host.configSources(), verify: cfg.verify, ci: cfg.ci, ...(tool.name === "tf_models" ? { roles: resolveRoleModels(cfg, host.models()) } : {}) }, null, 2) + (tool.name === "tf_init" ? "\nAlready attached read-only; no Taskflow scaffold required or created." : "") }
+      catch (e) { return `ERROR: ${(e as Error).message}. Existing OpenSpec required; use its native setup yourself, or explicitly configure backend=standalone for the legacy Taskflow planner.` }
+    }
+    return `ERROR: ${tool.name} is a standalone task-backlog API, disabled in OpenSpec mode. Use tf_openspec with a native change; no T-task/epic/board is created.`
+  } }))
 }
 
 /** Last assistant text, plus the error of the last failed assistant message if any. */

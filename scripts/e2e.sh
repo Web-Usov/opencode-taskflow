@@ -28,6 +28,7 @@ printf '{ "plugins": ["%s"] }\n' "$PLUGIN_DIR" > .opencode/opencode.jsonc
 LIVE_CHAIN="\"$LIVE_MODEL\""
 cat > .taskflow/config.jsonc <<EOF
 {
+  "backend": "standalone",
   "language": { "human": "en" },
   "verify": { "full": "npm test" },
   "agents": {

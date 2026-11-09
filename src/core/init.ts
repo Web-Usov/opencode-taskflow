@@ -62,6 +62,7 @@ export interface InitResult {
 
 /** Scaffolds the process files. Never overwrites an existing file. */
 export function init(root: string, cfg: TaskflowConfig, layout: RepoLayout, opts: { human?: string; agentsLink?: boolean; githubTemplate?: boolean } = {}): InitResult {
+  if (cfg.backend === "openspec") throw new Error("OpenSpec mode never scaffolds Taskflow planning files; attach through read-only tf_status instead")
   const human = opts.human ?? cfg.language.human
   const created: string[] = []
   const skipped: string[] = []
